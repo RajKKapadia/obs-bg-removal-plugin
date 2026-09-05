@@ -1,0 +1,43 @@
+#include "worker.hpp"
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+
+void require(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
+int main()
+{
+    try {
+        rmbg::Frame frame; frame.width = 2; frame.height = 1;
+        frame.rgba = {255, 0, 128, 255, 64, 32, 0, 128};
+        std::vector<float> tensor;
+        rmbg::prepare_rgb(frame, tensor);
+        require(tensor.size() == 6 && tensor[0] == 0.5f && tensor[2] == -0.5f, "RGB must be planar, scaled by 255, centered by 0.5");
+        require(std::abs(tensor[1]) < 0.0001 && std::abs(tensor[3] + 0.25f) < 0.0001, "Premultiplied RGB must be recovered");
+        frame.rgba.pop_back();
+        bool rejected = false;
+        try { rmbg::prepare_rgb(frame, tensor); } catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected, "Reject truncated input before accessing pixels");
+        const float values[] = {-2, 0, 2};
+        const auto mask = rmbg::normalize_mask(values, 3);
+        require(mask[0] == 0 && mask[1] == 128 && mask[2] == 255, "Match reference mask normalization");
+        const float ones[] = {1, 1}, zeros[] = {0, 0};
+        require(rmbg::normalize_mask(ones, 2)[0] == 255 && rmbg::normalize_mask(zeros, 2)[0] == 0, "Uniform masks must remain finite and meaningful");
+        const float nan[] = {0, std::numeric_limits<float>::quiet_NaN()};
+        rejected = false;
+        try { rmbg::normalize_mask(nan, 2); } catch (const std::runtime_error &) { rejected = true; }
+        require(rejected, "Reject non-finite model output");
+        rmbg::Worker worker;
+        worker.configure({"/nonexistent/rmbg.onnx", rmbg::Device::CPU, 2});
+        const auto deadline = rmbg::monotonic_ns() + 2000000000ULL;
+        while (worker.status().message.rfind("Error:", 0) != 0 && rmbg::monotonic_ns() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(!worker.status().ready && !worker.latest() && worker.status().message.rfind("Error:", 0) == 0,
+                "Missing model must yield an observable error and no mask");
+        require(!worker.submit({}), "Unready worker must reject frames");
+        const auto generation = worker.status().generation;
+        worker.configure({"/nonexistent/other.onnx", rmbg::Device::CPU, 2});
+        require(worker.status().generation == generation + 1 && !worker.latest(), "Changing models invalidates old results");
+        std::cout << "All core checks passed\n";
+    } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
+}

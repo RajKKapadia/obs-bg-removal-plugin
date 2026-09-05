@@ -1,0 +1,40 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d person_mask;
+uniform float threshold;
+uniform float softness;
+uniform bool preview_mask;
+
+sampler_state linear_sampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct Vertex {
+    float4 pos : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+Vertex VSDefault(Vertex v)
+{
+    v.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    return v;
+}
+
+float4 PSDefault(Vertex v) : TARGET
+{
+    float mask = person_mask.Sample(linear_sampler, v.uv).r;
+    float coverage = smoothstep(threshold - softness, threshold + softness, mask);
+    if (preview_mask)
+        return float4(coverage, coverage, coverage, 1.0);
+    // OBS textures use premultiplied alpha: multiply RGB and alpha together.
+    return image.Sample(linear_sampler, v.uv) * coverage;
+}
+
+technique Draw {
+    pass {
+        vertex_shader = VSDefault(v);
+        pixel_shader = PSDefault(v);
+    }
+}

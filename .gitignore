@@ -1,0 +1,70 @@
+# Downloaded SDKs, private CUDA libraries, and generated packages
+/.deps/
+/build*/
+/cmake-build*/
+/dist/
+/artifacts/
+
+# Model weights stay local; bootstrap.py downloads the pinned model
+*.onnx
+*.onnx.data
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+
+# CMake / compiler output, including accidental in-source builds
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+/Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local credentials; keep shareable environment templates
+.env
+.env.*
+!.env.example
+!.env.template
+!.env.*.example
+
+# Logs, interrupted downloads, and libobs test session files
+*.log
+*.part
+/:memory:.ses*
+
+# Machine-specific editor and agent state
+/.codex/
+/.agents/
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
