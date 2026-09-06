@@ -30,6 +30,43 @@ The original source, including its background, stays visible while loading, on e
 or when the last mask is older than the configured timeout. The filter is not a privacy
 barrier. A missing model can be fixed by selecting the correct file and clicking retry.
 
+## Lower delay and align motion (v0.3.0)
+
+**Low latency readback** is enabled by default, including for existing filters without a
+saved value. It submits the captured image to inference during the same OBS video tick,
+removing the previous mandatory one-tick wait. Inference remains on the worker thread;
+it never waits for a model result on the rendering thread. The graphics readback itself
+can still wait for the GPU. If OBS reports increased rendering lag on your scene, disable
+this option to restore deferred readback. **Refresh status** shows readback duration and
+mask age; these are snapshots, not a continuously updating meter.
+
+**Match video to mask** is optional and off by default. Enable it to display each completed
+mask with the exact video frame that produced it. The retained video stays at the source's
+full resolution on the GPU, even when RVM uses a smaller inference image. Until the next
+result arrives, the last complete video/mask pair repeats. This removes temporal offset
+between video and mask, but delays video and limits visible motion updates to the completed
+mask rate. It does not fix errors in the model's predicted outline. Audio timing is unchanged;
+you may need to adjust your microphone sync offset if the added video delay is noticeable.
+
+The matching cache allocates at most six source-sized RGBA textures (up to about 47.5 MiB
+at 1080p or 190 MiB at 4K, plus other processing buffers). Active inference and displayed
+results pin their own frame; dropped waiting captures release theirs. If every slot is
+occupied, the next capture is skipped instead of overwriting a retained frame or growing
+a queue. Turning matching off releases its GPU cache. Loading, invalid/missing pairs,
+model errors, source-size mismatches, and stale results show the original source.
+
+Extra **Temporal smoothing** is bypassed for matched captures to avoid mixing masks from
+different images. Your saved smoothing value is retained for live-video mode. RVM's own
+recurrent state remains enabled. Start with low latency readback on, matching on, and
+30 mask updates for RVM; reduce the camera size or RVM input limit if inference cannot
+keep up. Both options also work with RMBG.
+
+The worker reuses RGBA capture buffers instead of allocating and clearing them each frame.
+FP16 models receive a directly prepared FP16 input tensor; RVM FP16 alpha converts directly
+to bytes. This removes the previous full-size FP32 intermediates. Matching reuses GPU
+video textures for compositing without sending the full-resolution video through the CPU.
+The inference path still performs GPU/CPU transfers; it is not a zero-copy CUDA pipeline.
+
 ## Use RVM MobileNetV3
 
 RVM is the human video-matting model available in the author's TensorFlow.js/WebGL demo.
@@ -61,9 +98,9 @@ initially because RVM already has temporal memory.
 
 RVM's `pha` output is used directly as alpha, without RMBG's per-frame min/max normalization.
 Default threshold/softness preserve this alpha; adjusted controls remap it linearly.
-The current source supplies RGB; the model's estimated `fgr` RGB is not used. This keeps
-the visible video current while the newest completed alpha is applied. Outlines can still
-trail motion because capture, processing, and display take time.
+The captured source supplies RGB; the model's estimated `fgr` RGB is not used. Live-video
+mode combines the current image with the newest completed alpha, which can trail motion.
+Matching mode instead uses the full-resolution source image belonging to that alpha.
 
 To include both downloaded RVM files in an install, configure with
 `-DRVM_INSTALL_MODELS=ON` in addition to the other build options. This option defaults off.
@@ -213,7 +250,31 @@ canvas for the test; normal source transforms remain controlled by OBS.
 Append `30 0 10` to measure 10 seconds at 30 mask updates with smoothing disabled.
 The benchmark reports completed mask updates per second, masked video FPS, and mean
 displayed mask age (time from source capture to rendering with that mask). It excludes
-camera buffering, display latency, and the visual effect of temporal smoothing.
+camera buffering, display latency, and the visual effect of temporal smoothing. It also
+reports mean/max readback time, matched frames, cache size, and cache misses. Readback time
+covers mapping, the CPU copy, and submission; source rendering/staging time is included
+in mask age, not the readback timer.
+
+Set `RMBG_TEST_MATCH_VIDEO=1` to test matched video, or `RMBG_TEST_READBACK=deferred` to
+compare the compatibility path. For example, prefix the `xvfb-run` command with either
+or both environment assignments.
+
+A deterministic motion test uses a tiny generated ONNX graph whose mask is the red input
+channel. This separates frame-pairing correctness from a trained model's accuracy:
+
+```sh
+uv run --with onnx python tests/make-motion-model.py artifacts/motion.onnx
+RMBG_TEST_MOTION=1 RMBG_TEST_MATCH_VIDEO=1 RMBG_TEST_TOGGLE=1 \
+  xvfb-run -a build/obs-rmbg-smoke \
+  "$PWD/build/obs-rmbg.so" "$PWD/data" "$PWD/artifacts/motion.onnx" \
+  "$PWD/input.png" "$PWD/artifacts/motion-result.png" cpu 15 0.9 3
+```
+
+The input PNG supplies dimensions (at least 64 pixels per side); the test replaces it
+with a moving red foreground on a blue background. It checks every captured frame for
+incorrect background showing through the foreground mask. It also switches both options
+while processing, checks live video as a negative control, and verifies missing-model
+passthrough. The high saved smoothing value must not affect matched output.
 
 For RVM, use a portrait fixture with an opaque background. Add the opposite model family's
 ONNX path after the measurement arguments to also verify live landscape/portrait resizing,
@@ -235,21 +296,24 @@ Repeated image iterations reuse RVM state; use independent runs for unrelated st
 
 - `src/model.cpp`: detects model signatures, converts premultiplied RGBA to RGB NCHW
   (RMBG: `channel / 255 - 0.5`; RVM: `channel / 255`), handles FP32/FP16 tensors, and
-  runs ONNX. RVM recurrent tensors use device I/O binding and its alpha range is preserved.
+  runs ONNX. FP16 preprocessing and RVM alpha conversion avoid FP32 intermediate buffers.
+  RVM recurrent tensors use device I/O binding and its alpha range is preserved.
 - `src/worker.cpp`: loads models off the render thread and processes one in-flight
   frame with one replaceable waiting frame. New captures replace older waiting frames;
-  the queue never grows. Configuration generations invalidate both pending work and results.
-- `src/plugin.cpp`: captures at the model's selected size on the GPU, maps a staging transfer on a later
-  video tick while inference runs, uploads masks, and exposes OBS controls and diagnostic
-  status, including mask age. Capture scheduling follows the OBS video clock without
-  accumulating drift from render-thread timing variations.
+  the queue never grows. A bounded buffer pool reuses RGBA storage. Capture identity tokens
+  keep matching GPU frames alive without handing graphics objects to the worker.
+  Configuration generations invalidate both pending work and results.
+- `src/plugin.cpp`: captures at the model's selected size on the GPU, reads back immediately
+  or on the next video tick, and uploads masks. Optional full-resolution GPU frame retention
+  pairs video and mask by capture identity. Status includes mask age and readback duration.
+  Capture scheduling follows the OBS video clock without accumulating timing drift.
 - `data/rmbg.effect`: applies the mask to both RGB and alpha for correct premultiplied
   compositing, with threshold, softness, and mask preview controls.
 
-Model inference is asynchronous. The current source is combined with the newest completed
-mask; this favors uninterrupted video but can cause outlines to trail fast motion.
-Temporal smoothing is adjusted for elapsed time, resets across source-size changes or
-long gaps, and cannot eliminate all flicker from an image segmentation model.
+Model inference is asynchronous. Live-video mode combines the current source with the
+newest completed mask. Matching mode renders the original captured video with that mask.
+Extra temporal smoothing applies only to live-video captures; it adjusts for elapsed time
+and resets across source-size changes or long gaps. It cannot eliminate all model flicker.
 RMBG identifies salient objects, so it may preserve chairs and other objects as well as people.
 RVM is designed for human matting.
 
@@ -259,7 +323,9 @@ On Linux Mint 22.3, OBS 32.2.0, Intel Core Ultra 7 265K and NVIDIA RTX 5070 Ti:
 
 - C++ build and core checks passed.
 - Deterministic worker concurrency checks cover replacement of waiting frames, overlapping
-  capture/inference, and model changes while work is in flight.
+  capture/inference, model changes while work is in flight, video-token lifetimes, and safe
+  capture-buffer reuse. Fused FP16 preprocessing is bit-identical to the former path; direct
+  alpha conversion matches it for every finite FP16 value.
 - Official model download and cached CUDA library checksums verified.
 - RMBG FP32 inference: approximately **29–32 ms** per frame on CUDA after warmup;
   approximately **1.2 seconds** on CPU with two inference threads.
@@ -278,6 +344,18 @@ On Linux Mint 22.3, OBS 32.2.0, Intel Core Ultra 7 265K and NVIDIA RTX 5070 Ti:
   fixture after warmup, **30 mask updates/s**, and **66.7 ms** average displayed mask age
   in a five-second OBS test at 30 video FPS. A larger 850×1280 input took approximately
   **12–14 ms** in the short CLI check. Capture/display timing remains part of the delay.
+- Installed v0.3.0, same 512×600 portrait and 30 FPS test: low latency readback plus
+  matching video produced **30.0 masks/s** and **34.5 ms** average mask/video age, versus
+  **68.3 ms** with deferred readback in the comparison run. The cache used **3** textures
+  with no missed captures; map/copy/submission averaged **0.10 ms** (maximum **0.19 ms**,
+  rounded up). The earlier live-video low-latency run averaged **35.0 ms** mask age.
+  These five-second isolated tests use llvmpipe graphics and NVIDIA CUDA inference;
+  hardware graphics readback and your live-camera/recording load can differ.
+- A deterministic moving-foreground OBS test produced **zero mismatched opaque foreground
+  pixels** in matching mode, including transitions between immediate/deferred readback
+  and live/matched output with smoothing saved at 0.9. Live-video controls exposed the
+  expected temporal mismatch. Installed v0.3.0 also passed source resizing, RVM/RMBG
+  switching, foreground color preservation, missing-model fallback, and CUDA recurrence checks.
 - RVM FP16/FP32 CUDA and FP32 CPU passed actual recurrent-state reuse/reset checks.
   The OBS test passed source resizing in both orientations, RVM → RMBG → RVM switching,
   transparency, color preservation, and missing-model passthrough. Both RMBG precisions
@@ -296,7 +374,9 @@ On Linux Mint 22.3, OBS 32.2.0, Intel Core Ultra 7 265K and NVIDIA RTX 5070 Ti:
 - **Error after inference starts:** the original source is shown. Fix the runtime/model
   issue and retry, or explicitly select CPU. Initialization fallback does not hide
   runtime inference errors.
-- **Cutout trails movement:** confirm **Ready: CUDA** and set smoothing to **0**.
+- **Cutout trails movement:** confirm **Ready: CUDA**, enable **Low latency readback**, and
+  set smoothing to **0** in live-video mode. Enable **Match video to mask** for aligned edges
+  with buffered video; visible motion then updates at the completed mask rate.
   Try **30** mask updates if there is spare GPU capacity; return to **15** if mask age or
   OBS rendering lag increases. Refresh status to inspect processing time and mask age. The model
   still needs time to process each frame; increasing the limit above its throughput cannot

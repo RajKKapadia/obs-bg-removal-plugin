@@ -30,7 +30,7 @@ bool continues_sequence(const Frame &previous, const Frame &current)
            current.timestamp_ns - previous.timestamp_ns < 1000000000ULL;
 }
 
-void prepare_rgb(const Frame &frame, std::vector<float> &tensor, ModelKind kind)
+template<class T> void prepare_rgb_impl(const Frame &frame, std::vector<T> &tensor, ModelKind kind)
 {
     const size_t n = size_t(frame.width) * frame.height;
     if (!n || frame.rgba.size() != n * 4)
@@ -41,10 +41,12 @@ void prepare_rgb(const Frame &frame, std::vector<float> &tensor, ModelKind kind)
         const float alpha = frame.rgba[i * 4 + 3] / 255.0f;
         for (size_t c = 0; c < 3; ++c) {
             const float rgb = alpha > 0 ? std::min(1.0f, frame.rgba[i * 4 + c] / (255.0f * alpha)) : 0;
-            tensor[c * n + i] = rgb - (kind == ModelKind::RMBG ? 0.5f : 0.0f);
+            tensor[c * n + i] = T(rgb - (kind == ModelKind::RMBG ? 0.5f : 0.0f));
         }
     }
 }
+void prepare_rgb(const Frame &frame, std::vector<float> &tensor, ModelKind kind) { prepare_rgb_impl(frame, tensor, kind); }
+void prepare_rgb(const Frame &frame, std::vector<Ort::Float16_t> &tensor, ModelKind kind) { prepare_rgb_impl(frame, tensor, kind); }
 
 std::vector<uint8_t> normalize_mask(const float *data, size_t size)
 {
@@ -67,16 +69,19 @@ std::vector<uint8_t> normalize_mask(const float *data, size_t size)
     return pixels;
 }
 
-std::vector<uint8_t> alpha_mask(const float *data, size_t size)
+template<class T> std::vector<uint8_t> alpha_mask_impl(const T *data, size_t size)
 {
     if (!data || !size) throw std::invalid_argument("Empty alpha matte");
     std::vector<uint8_t> pixels(size);
     for (size_t i = 0; i < size; ++i) {
-        if (!std::isfinite(data[i])) throw std::runtime_error("Model produced a non-finite alpha matte");
-        pixels[i] = uint8_t(std::lround(std::clamp(data[i], 0.0f, 1.0f) * 255));
+        const float value = float(data[i]);
+        if (!std::isfinite(value)) throw std::runtime_error("Model produced a non-finite alpha matte");
+        pixels[i] = uint8_t(std::lround(std::clamp(value, 0.0f, 1.0f) * 255));
     }
     return pixels;
 }
+std::vector<uint8_t> alpha_mask(const float *data, size_t size) { return alpha_mask_impl(data, size); }
+std::vector<uint8_t> alpha_mask(const Ort::Float16_t *data, size_t size) { return alpha_mask_impl(data, size); }
 
 namespace {
 struct TensorSpec { ONNXTensorElementDataType type; std::vector<int64_t> shape; };
@@ -186,13 +191,13 @@ Model::Model(const ModelConfig &config) : config_(config)
 
 Ort::Value Model::input_tensor(const Frame &frame)
 {
-    prepare_rgb(frame, input_, kind_);
     const std::array<int64_t, 4> shape{1, 3, frame.height, frame.width};
     if (input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-        input_half_.resize(input_.size());
-        std::transform(input_.begin(), input_.end(), input_half_.begin(), [](float value) { return Ort::Float16_t(value); });
+        // Write the final FP16 tensor directly, without a full FP32 intermediate.
+        prepare_rgb(frame, input_half_, kind_);
         return Ort::Value::CreateTensor<Ort::Float16_t>(memory_, input_half_.data(), input_half_.size(), shape.data(), shape.size());
     }
+    prepare_rgb(frame, input_, kind_);
     return Ort::Value::CreateTensor<float>(memory_, input_.data(), input_.size(), shape.data(), shape.size());
 }
 
@@ -264,17 +269,23 @@ Mask Model::run(const Frame &frame)
     mask.source_width = frame.source_width; mask.source_height = frame.source_height;
     mask.timestamp_ns = frame.timestamp_ns; mask.generation = frame.generation;
     const size_t count = size_t(frame.width) * frame.height;
+    mask.direct_alpha = kind_ == ModelKind::RVM;
     std::vector<float> expanded;
     const float *alpha;
     if (result_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-        expanded.resize(count);
         const auto *half = result.GetTensorData<Ort::Float16_t>();
-        std::transform(half, half + count, expanded.begin(), [](Ort::Float16_t value) { return value.ToFloat(); });
-        alpha = expanded.data();
+        if (mask.direct_alpha) {
+            // RVM alpha needs one conversion pass, not an FP32 expansion followed by quantization.
+            mask.pixels = alpha_mask(half, count);
+            alpha = nullptr;
+        } else {
+            expanded.resize(count);
+            std::transform(half, half + count, expanded.begin(), [](Ort::Float16_t value) { return value.ToFloat(); });
+            alpha = expanded.data();
+        }
     } else if (result_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) alpha = result.GetTensorData<float>();
     else throw std::runtime_error("Expected floating-point mask output");
-    mask.direct_alpha = kind_ == ModelKind::RVM;
-    mask.pixels = mask.direct_alpha ? alpha_mask(alpha, count) : normalize_mask(alpha, count);
+    if (alpha) mask.pixels = mask.direct_alpha ? alpha_mask(alpha, count) : normalize_mask(alpha, count);
     mask.recurrent_frames = recurrent_frames_;
     mask.recurrent_on_gpu = kind_ == ModelKind::RVM && recurrent_[0].GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU;
     mask.inference_ms = (monotonic_ns() - started) / 1e6;

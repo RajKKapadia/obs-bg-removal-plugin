@@ -31,6 +31,22 @@ void Worker::set_smoothing(float value)
     std::lock_guard<std::mutex> lock(mutex_);
     smoothing_ = std::clamp(value, 0.0f, 0.95f);
 }
+std::vector<uint8_t> Worker::acquire_rgba(size_t bytes)
+{
+    std::vector<uint8_t> buffer;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto &free : free_rgba_) if (!free.empty()) { buffer.swap(free); break; }
+    }
+    // Reused buffers already have this size: avoid allocation and zero-filling
+    // every capture before the readback overwrites all of the bytes.
+    buffer.resize(bytes);
+    return buffer;
+}
+void Worker::recycle_rgba(std::vector<uint8_t> &buffer)
+{
+    for (auto &free : free_rgba_) if (free.empty()) { buffer.swap(free); return; }
+}
 bool Worker::submit(Frame frame)
 {
     {
@@ -39,6 +55,7 @@ bool Worker::submit(Frame frame)
         // An overloaded worker always takes the newest waiting frame next.
         if (stopping_ || !status_.ready || frame.generation != status_.generation)
             return false;
+        if (pending_) recycle_rgba(pending_->rgba);
         pending_ = std::move(frame);
         status_.busy = true;
     }
@@ -89,8 +106,9 @@ void Worker::run()
             }
             if (!frame || !model) continue;
             auto mask = std::make_shared<Mask>(model->run(*frame));
+            mask->capture_token = frame->capture_token;
             // Smoothing is expressed at 30 Hz so slow inference doesn't add seconds of lag.
-            if (smoothing > 0 && (!mask->direct_alpha || mask->recurrent_frames > 1) && previous && previous->generation == generation &&
+            if (!mask->capture_token && smoothing > 0 && (!mask->direct_alpha || mask->recurrent_frames > 1) && previous && previous->generation == generation &&
                 previous->width == mask->width && previous->height == mask->height && previous->pixels.size() == mask->pixels.size() &&
                 previous->source_width == mask->source_width && previous->source_height == mask->source_height &&
                 mask->timestamp_ns > previous->timestamp_ns && mask->timestamp_ns - previous->timestamp_ns < 1000000000ULL) {
@@ -100,6 +118,7 @@ void Worker::run()
                     mask->pixels[i] = uint8_t(std::lround(previous->pixels[i] * weight + mask->pixels[i] * (1 - weight)));
             }
             std::lock_guard<std::mutex> lock(mutex_);
+            recycle_rgba(frame->rgba);
             if (generation != status_.generation) continue;
             status_.busy = pending_.has_value();
             status_.inference_ms = mask->inference_ms;

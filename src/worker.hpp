@@ -26,11 +26,13 @@ public:
     Worker &operator=(const Worker &) = delete;
     void configure(ModelConfig config, bool force = false);
     void set_smoothing(float value);
+    std::vector<uint8_t> acquire_rgba(size_t bytes);
     bool submit(Frame frame);
     WorkerStatus status() const;
     std::shared_ptr<const Mask> latest() const;
 private:
     void run();
+    void recycle_rgba(std::vector<uint8_t> &buffer); // mutex_ held; never recycles active inference.
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool stopping_ = false, reload_ = false, configured_ = false;
@@ -39,6 +41,7 @@ private:
     WorkerStatus status_;
     std::optional<Frame> pending_;
     std::shared_ptr<const Mask> mask_;
+    std::array<std::vector<uint8_t>, 3> free_rgba_;
     std::thread thread_;
 };
 }

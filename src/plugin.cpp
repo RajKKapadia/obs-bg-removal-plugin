@@ -17,11 +17,14 @@ namespace {
 struct Settings {
     int max_fps = 15, stale_ms = 2000;
     float threshold = 0.5f, softness = 0.5f;
-    bool preview = false;
+    bool preview = false, immediate_readback = true, match_video = false;
 };
 struct RenderStats {
     uint64_t masked_frames = 0;
     double mask_age_ms = 0, mask_age_sum_ms = 0;
+    uint64_t readbacks = 0, matched_frames = 0, cache_misses = 0;
+    double readback_ms = 0, readback_sum_ms = 0, readback_max_ms = 0, video_delay_ms = 0;
+    uint64_t cached_frames = 0;
 };
 class Filter {
 public:
@@ -43,6 +46,7 @@ public:
         gs_stagesurface_destroy(stage_);
         gs_texrender_destroy(capture_);
         gs_texture_destroy(mask_texture_);
+        for (auto &frame : video_cache_) gs_texrender_destroy(frame.texture);
         gs_effect_destroy(effect_);
         obs_leave_graphics();
     }
@@ -61,6 +65,8 @@ public:
         settings.threshold = float(std::clamp(obs_data_get_double(data, "threshold"), 0.0, 1.0));
         settings.softness = float(std::clamp(obs_data_get_double(data, "softness"), 0.001, 0.5));
         settings.preview = obs_data_get_bool(data, "preview");
+        settings.immediate_readback = obs_data_get_bool(data, "immediate_readback");
+        settings.match_video = obs_data_get_bool(data, "match_video");
         { std::lock_guard<std::mutex> lock(mutex_); settings_ = settings; }
         worker_.set_smoothing(float(obs_data_get_double(data, "smoothing")));
         worker_.configure(std::move(model), retry);
@@ -83,6 +89,9 @@ public:
         auto mask = worker_.latest();
         std::lock_guard<std::mutex> lock(mutex_);
         if (render_stats_.masked_frames) text << "; mask age: " << render_stats_.mask_age_ms << " ms";
+        if (render_stats_.readbacks) text << "; readback: " << render_stats_.readback_ms << " ms";
+        if (settings_.match_video) text << "; matched video (delay: " << render_stats_.video_delay_ms
+                                       << " ms; extra smoothing disabled)";
         if (!render_error_.empty()) text << ". " << render_error_;
         if (mask && rmbg::monotonic_ns() - mask->timestamp_ns > uint64_t(settings_.stale_ms) * 1000000)
             text << ". Mask stale; original source visible";
@@ -113,31 +122,38 @@ public:
         const uint64_t tick = obs_get_video_frame_time();
         if (tick != last_tick_) {
             last_tick_ = tick;
-            // Map a transfer issued on an earlier video tick, not immediately after staging.
-            if (readback_pending_) {
-                readback_pending_ = false;
-                if (state.ready && staged_frame_.generation == state.generation &&
-                    staged_frame_.source_width == width && staged_frame_.source_height == height &&
-                    now - staged_frame_.timestamp_ns < 250000000ULL) {
-                    uint8_t *bytes = nullptr; uint32_t stride = 0;
-                    if (gs_stagesurface_map(stage_, &bytes, &stride)) {
-                        // Allocate before mapping below; memcpy cannot throw while GPU memory is mapped.
-                        for (uint32_t y = 0; y < staged_frame_.height; ++y)
-                            std::memcpy(staged_frame_.rgba.data() + size_t(y) * staged_frame_.width * 4,
-                                        bytes + size_t(y) * stride, size_t(staged_frame_.width) * 4);
-                        gs_stagesurface_unmap(stage_);
-                        worker_.submit(std::move(staged_frame_));
-                    } else error("GPU readback failed; original source used until a fresh mask is available");
+            readback_frame(state, width, height);
+            if (!settings.match_video) {
+                // Tokens own identity only, so releasing these GPU resources is safe
+                // even while old inference completes. Re-enabling waits for a new pair.
+                for (auto &frame : video_cache_) {
+                    gs_texrender_destroy(frame.texture); frame = {};
                 }
+                std::lock_guard<std::mutex> lock(mutex_);
+                render_stats_.cached_frames = 0;
+                render_stats_.video_delay_ms = 0;
             }
             state = worker_.status();
             if (state.ready && capture_schedule_.due(tick, unsigned(settings.max_fps))) {
-                capture_frame(state, width, height, now);
+                capture_frame(state, width, height, now, settings.match_video);
+                // Start inference this tick instead of imposing a whole video-frame wait.
+                // Mapping can block briefly on the GPU; the deferred option remains available.
+                if (settings.immediate_readback) readback_frame(state, width, height);
             }
         }
         const auto mask = worker_.latest();
         if (!mask || mask->generation != state.generation || mask->source_width != width || mask->source_height != height ||
             now - mask->timestamp_ns > uint64_t(settings.stale_ms) * 1000000) {
+            uploaded_mask_.reset();
+            obs_source_skip_video_filter(source_); return;
+        }
+        gs_texture_t *matching_video = nullptr;
+        if (settings.match_video && mask->capture_token) {
+            for (const auto &frame : video_cache_)
+                if (frame.token == mask->capture_token) matching_video = gs_texrender_get_texture(frame.texture);
+        }
+        if (settings.match_video && !matching_video) {
+            uploaded_mask_.reset();
             obs_source_skip_video_filter(source_); return;
         }
         if (mask != uploaded_mask_) {
@@ -149,38 +165,87 @@ public:
             gs_texture_set_image(mask_texture_, mask->pixels.data(), mask->width, false);
             uploaded_mask_ = mask;
         }
-        if (!obs_source_process_filter_begin(source_, GS_RGBA, OBS_NO_DIRECT_RENDERING)) return;
+        if (!matching_video && !obs_source_process_filter_begin(source_, GS_RGBA, OBS_NO_DIRECT_RENDERING)) return;
         gs_effect_set_texture(gs_effect_get_param_by_name(effect_, "person_mask"), mask_texture_);
         gs_effect_set_float(gs_effect_get_param_by_name(effect_, "threshold"), settings.threshold);
         gs_effect_set_float(gs_effect_get_param_by_name(effect_, "softness"), settings.softness);
         gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "preview_mask"), settings.preview);
         gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "direct_alpha"), mask->direct_alpha);
-        obs_source_process_filter_end(source_, effect_, width, height);
+        if (matching_video) {
+            const bool linear = gs_set_linear_srgb(false);
+            const bool srgb = gs_framebuffer_srgb_enabled();
+            gs_enable_framebuffer_srgb(false);
+            gs_effect_set_texture(gs_effect_get_param_by_name(effect_, "image"), matching_video);
+            while (gs_effect_loop(effect_, "Draw")) gs_draw_sprite(matching_video, 0, width, height);
+            gs_enable_framebuffer_srgb(srgb);
+            gs_set_linear_srgb(linear);
+        } else obs_source_process_filter_end(source_, effect_, width, height);
         if (tick != last_stats_tick_) {
             last_stats_tick_ = tick;
             std::lock_guard<std::mutex> lock(mutex_);
             ++render_stats_.masked_frames;
-            render_stats_.mask_age_ms = double(now - mask->timestamp_ns) / 1e6;
+            render_stats_.mask_age_ms = double(rmbg::monotonic_ns() - mask->timestamp_ns) / 1e6;
+            render_stats_.video_delay_ms = matching_video ? render_stats_.mask_age_ms : 0;
+            render_stats_.matched_frames += matching_video != nullptr;
             render_stats_.mask_age_sum_ms += render_stats_.mask_age_ms;
         }
     }
 private:
-    void capture_frame(const rmbg::WorkerStatus &state, uint32_t width, uint32_t height, uint64_t now)
+    struct CachedVideo {
+        gs_texrender_t *texture = nullptr;
+        std::shared_ptr<const rmbg::CaptureToken> token;
+    };
+    CachedVideo *acquire_video()
     {
-        const auto size = rmbg::capture_size(state.kind, width, height, state.capture_limit);
-        if (!capture_) capture_ = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-        if (stage_ && (gs_stagesurface_get_width(stage_) != size.width || gs_stagesurface_get_height(stage_) != size.height)) {
-            gs_stagesurface_destroy(stage_); stage_ = nullptr;
+        for (auto &frame : video_cache_) {
+            // The stage, active worker, waiting frame, and completed masks pin their
+            // slots independently. Never overwrite a frame still used by any of them.
+            if (!frame.token || frame.token.use_count() == 1) {
+                frame.token = std::make_shared<rmbg::CaptureToken>();
+                if (!frame.texture) frame.texture = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+                if (!frame.texture) throw std::runtime_error("Could not allocate matching video texture");
+                return &frame;
+            }
         }
-        if (!stage_) stage_ = gs_stagesurface_create(size.width, size.height, GS_RGBA);
-        if (!capture_ || !stage_) throw std::runtime_error("Could not allocate GPU capture buffers");
-        // RMBG uses 1024x1024. RVM retains the source aspect ratio within its size limit.
-        staged_frame_.width = size.width; staged_frame_.height = size.height;
-        staged_frame_.source_width = width; staged_frame_.source_height = height;
-        staged_frame_.generation = state.generation; staged_frame_.timestamp_ns = now;
-        staged_frame_.rgba.resize(size_t(size.width) * size.height * 4);
-        gs_texrender_reset(capture_);
-        if (!gs_texrender_begin_with_color_space(capture_, size.width, size.height, GS_CS_SRGB))
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++render_stats_.cache_misses;
+        return nullptr; // Drop this capture instead of growing the queue or breaking a pair.
+    }
+    void readback_frame(const rmbg::WorkerStatus &state, uint32_t width, uint32_t height)
+    {
+        if (!readback_pending_) return;
+        readback_pending_ = false;
+        if (!state.ready || staged_frame_.generation != state.generation ||
+            staged_frame_.source_width != width || staged_frame_.source_height != height ||
+            rmbg::monotonic_ns() - staged_frame_.timestamp_ns >= 250000000ULL) {
+            staged_frame_ = {}; return;
+        }
+        const auto started = rmbg::monotonic_ns();
+        uint8_t *bytes = nullptr; uint32_t stride = 0;
+        if (!gs_stagesurface_map(stage_, &bytes, &stride)) {
+            staged_frame_ = {};
+            error("GPU readback failed; original source used until a fresh mask is available"); return;
+        }
+        // Allocation happens before mapping. One bulk copy suffices for tight rows.
+        const size_t row = size_t(staged_frame_.width) * 4;
+        if (stride == row) std::memcpy(staged_frame_.rgba.data(), bytes, row * staged_frame_.height);
+        else for (uint32_t y = 0; y < staged_frame_.height; ++y)
+            std::memcpy(staged_frame_.rgba.data() + y * row, bytes + size_t(y) * stride, row);
+        gs_stagesurface_unmap(stage_);
+        worker_.submit(std::move(staged_frame_));
+        staged_frame_ = {};
+        const double elapsed = double(rmbg::monotonic_ns() - started) / 1e6;
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++render_stats_.readbacks;
+        render_stats_.readback_ms = elapsed;
+        render_stats_.readback_sum_ms += elapsed;
+        render_stats_.readback_max_ms = std::max(render_stats_.readback_max_ms, elapsed);
+    }
+    void render_capture(gs_texrender_t *destination, uint32_t width, uint32_t height,
+                        uint32_t source_width, uint32_t source_height, gs_texture_t *cached = nullptr)
+    {
+        gs_texrender_reset(destination);
+        if (!gs_texrender_begin_with_color_space(destination, width, height, GS_CS_SRGB))
             throw std::runtime_error("Could not begin source capture");
         const bool linear = gs_set_linear_srgb(false);
         const bool srgb = gs_framebuffer_srgb_enabled();
@@ -189,14 +254,53 @@ private:
         gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
         vec4 clear{};
         gs_clear(GS_CLEAR_COLOR, &clear, 0, 0);
-        gs_ortho(0, float(width), 0, float(height), -100, 100);
-        obs_source_skip_video_filter(source_);
+        gs_ortho(0, float(source_width), 0, float(source_height), -100, 100);
+        if (cached) {
+            // Downsample the exact retained frame entirely on the GPU. Its alpha
+            // is already premultiplied, so copying must not multiply it a second time.
+            gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+            auto *copy = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+            gs_effect_set_texture(gs_effect_get_param_by_name(copy, "image"), cached);
+            while (gs_effect_loop(copy, "Draw")) gs_draw_sprite(cached, 0, source_width, source_height);
+        } else obs_source_skip_video_filter(source_);
         gs_blend_state_pop();
         gs_enable_framebuffer_srgb(srgb);
         gs_set_linear_srgb(linear);
-        gs_texrender_end(capture_);
-        gs_stage_texture(stage_, gs_texrender_get_texture(capture_));
+        gs_texrender_end(destination);
+    }
+    void capture_frame(const rmbg::WorkerStatus &state, uint32_t width, uint32_t height, uint64_t now, bool match_video)
+    {
+        const auto size = rmbg::capture_size(state.kind, width, height, state.capture_limit);
+        auto *video = match_video ? acquire_video() : nullptr;
+        if (match_video && !video) return;
+        if (stage_ && (gs_stagesurface_get_width(stage_) != size.width || gs_stagesurface_get_height(stage_) != size.height)) {
+            gs_stagesurface_destroy(stage_); stage_ = nullptr;
+        }
+        if (!stage_) stage_ = gs_stagesurface_create(size.width, size.height, GS_RGBA);
+        if (!stage_) throw std::runtime_error("Could not allocate GPU readback buffer");
+        staged_frame_.width = size.width; staged_frame_.height = size.height;
+        staged_frame_.source_width = width; staged_frame_.source_height = height;
+        staged_frame_.generation = state.generation; staged_frame_.timestamp_ns = now;
+        staged_frame_.capture_token = video ? video->token : nullptr;
+        staged_frame_.rgba = worker_.acquire_rgba(size_t(size.width) * size.height * 4);
+        gs_texture_t *texture = nullptr;
+        if (video) {
+            render_capture(video->texture, width, height, width, height);
+            texture = gs_texrender_get_texture(video->texture);
+        }
+        if (!texture || size.width != width || size.height != height) {
+            if (!capture_) capture_ = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+            if (!capture_) throw std::runtime_error("Could not allocate GPU capture buffer");
+            render_capture(capture_, size.width, size.height, width, height, texture);
+            texture = gs_texrender_get_texture(capture_);
+        }
+        gs_stage_texture(stage_, texture);
         readback_pending_ = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            render_stats_.cached_frames = std::count_if(video_cache_.begin(), video_cache_.end(),
+                [](const CachedVideo &entry) { return entry.texture != nullptr; });
+        }
         error("");
     }
     obs_source_t *source_;
@@ -207,6 +311,7 @@ private:
     std::string render_error_;
     gs_effect_t *effect_ = nullptr;
     gs_texrender_t *capture_ = nullptr;
+    std::array<CachedVideo, 6> video_cache_{};
     gs_stagesurf_t *stage_ = nullptr;
     gs_texture_t *mask_texture_ = nullptr;
     std::shared_ptr<const rmbg::Mask> uploaded_mask_;
@@ -231,6 +336,8 @@ void defaults(obs_data_t *data)
     obs_data_set_default_double(data, "threshold", 0.5);
     obs_data_set_default_double(data, "softness", 0.5);
     obs_data_set_default_bool(data, "preview", false);
+    obs_data_set_default_bool(data, "immediate_readback", true);
+    obs_data_set_default_bool(data, "match_video", false);
 }
 void status_proc(void *data, calldata_t *params)
 {
@@ -246,6 +353,13 @@ void status_proc(void *data, calldata_t *params)
         calldata_set_bool(params, "is_rvm", state.kind == rmbg::ModelKind::RVM);
         calldata_set_int(params, "mask_width", state.width); calldata_set_int(params, "mask_height", state.height);
         const auto render = filter->render_stats();
+        calldata_set_int(params, "readbacks", render.readbacks);
+        calldata_set_float(params, "readback_sum_ms", render.readback_sum_ms);
+        calldata_set_float(params, "readback_max_ms", render.readback_max_ms);
+        calldata_set_int(params, "matched_frames", render.matched_frames);
+        calldata_set_int(params, "cached_frames", render.cached_frames);
+        calldata_set_int(params, "cache_misses", render.cache_misses);
+        calldata_set_float(params, "video_delay_ms", render.video_delay_ms);
         calldata_set_int(params, "masked_frames", render.masked_frames);
         calldata_set_float(params, "mask_age_ms", render.mask_age_ms);
         calldata_set_float(params, "mask_age_sum_ms", render.mask_age_sum_ms);
@@ -257,7 +371,7 @@ void *create(obs_data_t *data, obs_source_t *source)
         auto filter = std::make_unique<Filter>(source);
         filter->update(data);
         proc_handler_add(obs_source_get_proc_handler(source),
-            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready, out int masked_frames, out float mask_age_ms, out float mask_age_sum_ms, out int recurrent_frames, out bool recurrent_on_gpu, out bool is_rvm, out int mask_width, out int mask_height)", status_proc, filter.get());
+            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready, out int masked_frames, out float mask_age_ms, out float mask_age_sum_ms, out int recurrent_frames, out bool recurrent_on_gpu, out bool is_rvm, out int mask_width, out int mask_height, out int readbacks, out float readback_sum_ms, out float readback_max_ms, out int matched_frames, out int cached_frames, out int cache_misses, out float video_delay_ms)", status_proc, filter.get());
         return filter.release();
     } catch (const std::exception &e) { blog(LOG_ERROR, "[obs-rmbg] Creation failed: %s", e.what()); return nullptr; }
 }
@@ -296,6 +410,8 @@ obs_properties_t *properties(void *data)
     obs_property_list_add_string(device, obs_module_text("DeviceCUDA"), "cuda");
     obs_properties_add_int_slider(props, "threads", obs_module_text("Threads"), 1, 32, 1);
     obs_properties_add_int_slider(props, "max_fps", obs_module_text("MaxFPS"), 1, 60, 1);
+    obs_properties_add_bool(props, "immediate_readback", obs_module_text("ImmediateReadback"));
+    obs_properties_add_bool(props, "match_video", obs_module_text("MatchVideo"));
     obs_properties_add_float_slider(props, "smoothing", obs_module_text("Smoothing"), 0, 0.95, 0.05);
     obs_properties_add_float_slider(props, "threshold", obs_module_text("Threshold"), 0, 1, 0.01);
     obs_properties_add_float_slider(props, "softness", obs_module_text("Softness"), 0.001, 0.5, 0.01);
@@ -337,6 +453,6 @@ bool obs_module_load(void)
     info.get_properties = properties;
     info.video_render = render;
     obs_register_source(&info);
-    blog(LOG_INFO, "[obs-rmbg] Loaded v0.2.0 (ONNX Runtime %s)", Ort::GetVersionString().c_str());
+    blog(LOG_INFO, "[obs-rmbg] Loaded v0.3.0 (ONNX Runtime %s)", Ort::GetVersionString().c_str());
     return true;
 }

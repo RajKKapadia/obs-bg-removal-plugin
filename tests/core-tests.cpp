@@ -30,6 +30,28 @@ int main()
         rmbg::prepare_rgb(frame, tensor, rmbg::ModelKind::RVM);
         require(tensor[0] == 1.0f && tensor[2] == 0.0f && std::abs(tensor[1] - 0.5f) < 0.0001,
                 "RVM needs uncentered RGB in 0..1 with premultiplied RGB recovered");
+        // Check fused conversion against the previous FP32-then-FP16 path,
+        // including transparent and invalid premultiplied channel values.
+        frame.width = 256; frame.height = 256; frame.rgba.resize(256 * 256 * 4);
+        for (size_t i = 0; i < 256 * 256; ++i) {
+            frame.rgba[i * 4] = uint8_t(i); frame.rgba[i * 4 + 1] = uint8_t(255 - i);
+            frame.rgba[i * 4 + 2] = uint8_t(i / 7); frame.rgba[i * 4 + 3] = uint8_t(i / 256);
+        }
+        for (const auto kind : {rmbg::ModelKind::RMBG, rmbg::ModelKind::RVM}) {
+            rmbg::prepare_rgb(frame, tensor, kind);
+            std::vector<Ort::Float16_t> half;
+            rmbg::prepare_rgb(frame, half, kind);
+            for (size_t i = 0; i < tensor.size(); ++i)
+                require(half[i].val == Ort::Float16_t(tensor[i]).val, "Fused FP16 input must be bit-identical");
+        }
+        std::vector<Ort::Float16_t> all_half;
+        std::vector<float> all_float;
+        for (unsigned bits = 0; bits < 65536; ++bits) {
+            Ort::Float16_t half; half.val = uint16_t(bits);
+            if (std::isfinite(half.ToFloat())) { all_half.push_back(half); all_float.push_back(half.ToFloat()); }
+        }
+        require(rmbg::alpha_mask(all_half.data(), all_half.size()) == rmbg::alpha_mask(all_float.data(), all_float.size()),
+                "Fused alpha conversion must preserve every finite FP16 value exactly");
         frame.rgba.pop_back();
         bool rejected = false;
         try { rmbg::prepare_rgb(frame, tensor); } catch (const std::invalid_argument &) { rejected = true; }

@@ -2,6 +2,7 @@
 #include <onnxruntime_cxx_api.h>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,17 +22,22 @@ struct ModelConfig {
                rvm_max_size == other.rvm_max_size && rvm_downsample == other.rvm_downsample;
     }
 };
+// Identity only: graphics resources always remain owned by the OBS render thread.
+// A worker or result holding this token prevents reuse of its cached video frame.
+struct CaptureToken {};
 struct Frame {
     std::vector<uint8_t> rgba;
     uint32_t width = 0, height = 0;
     uint32_t source_width = 0, source_height = 0;
     uint64_t timestamp_ns = 0, generation = 0;
+    std::shared_ptr<const CaptureToken> capture_token;
 };
 struct Mask {
     std::vector<uint8_t> pixels;
     uint32_t width = 0, height = 0;
     uint32_t source_width = 0, source_height = 0;
     uint64_t timestamp_ns = 0, generation = 0;
+    std::shared_ptr<const CaptureToken> capture_token;
     double inference_ms = 0;
     bool direct_alpha = false;
     uint64_t recurrent_frames = 0;
@@ -39,8 +45,10 @@ struct Mask {
 };
 bool continues_sequence(const Frame &previous, const Frame &current);
 void prepare_rgb(const Frame &frame, std::vector<float> &tensor, ModelKind kind = ModelKind::RMBG);
+void prepare_rgb(const Frame &frame, std::vector<Ort::Float16_t> &tensor, ModelKind kind = ModelKind::RMBG);
 std::vector<uint8_t> normalize_mask(const float *data, size_t size);
 std::vector<uint8_t> alpha_mask(const float *data, size_t size);
+std::vector<uint8_t> alpha_mask(const Ort::Float16_t *data, size_t size);
 class Model {
 public:
     explicit Model(const ModelConfig &config);
