@@ -2,6 +2,7 @@
 #include <obs.h>
 #include <obs-nix-platform.h>
 #include <chrono>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -9,11 +10,16 @@
 #include <thread>
 
 namespace {
-struct ImageSource { image_io::Image image; gs_texture_t *texture = nullptr; };
+struct ImageSource {
+    image_io::Image image;
+    gs_texture_t *texture = nullptr;
+    std::atomic<uint32_t> width{0}, height{0};
+};
 void *create_image(obs_data_t *settings, obs_source_t *)
 {
     try {
         auto *s = new ImageSource{image_io::read(obs_data_get_string(settings, "path")), nullptr};
+        s->width = s->image.width; s->height = s->image.height;
         obs_enter_graphics(); const uint8_t *ptr = s->image.rgba.data();
         s->texture = gs_texture_create(s->image.width, s->image.height, GS_RGBA, 1, &ptr, 0);
         obs_leave_graphics(); return s;
@@ -36,9 +42,12 @@ void receive(void *data, video_data *frame)
 }
 int main(int argc, char **argv)
 {
-    if (argc != 7) {
-        std::cerr << "Usage: obs-rmbg-smoke PLUGIN.so DATA_DIR MODEL.onnx INPUT.png OUTPUT.png cpu|cuda|auto\n"; return 2;
+    if (argc != 7 && argc != 10 && argc != 11) {
+        std::cerr << "Usage: obs-rmbg-smoke PLUGIN.so DATA_DIR MODEL.onnx INPUT.png OUTPUT.png cpu|cuda|auto [MAX_FPS SMOOTHING MEASURE_SECONDS [SWITCH_MODEL.onnx]]\n"; return 2;
     }
+    const int measure_seconds = argc >= 10 ? std::stoi(argv[9]) : 0;
+    if (argc >= 10 && (std::stoi(argv[7]) < 1 || std::stoi(argv[7]) > 60 ||
+                      std::stod(argv[8]) < 0 || std::stod(argv[8]) > 0.95 || measure_seconds < 1 || measure_seconds > 60)) return 2;
     obs_set_nix_platform(OBS_NIX_PLATFORM_X11_EGL);
     if (!obs_startup("en-US", nullptr, nullptr)) return 3;
     obs_video_info video{};
@@ -53,23 +62,33 @@ int main(int argc, char **argv)
     info.id = "rmbg_test_image"; info.type = OBS_SOURCE_TYPE_INPUT; info.output_flags = OBS_SOURCE_VIDEO;
     info.get_name = [](void *) { return "RMBG test image"; }; info.create = create_image;
     info.destroy = [](void *data) { auto *s = static_cast<ImageSource *>(data); obs_enter_graphics(); gs_texture_destroy(s->texture); obs_leave_graphics(); delete s; };
-    info.get_width = [](void *data) { return static_cast<ImageSource *>(data)->image.width; };
-    info.get_height = [](void *data) { return static_cast<ImageSource *>(data)->image.height; };
+    info.get_width = [](void *data) { return static_cast<ImageSource *>(data)->width.load(); };
+    info.get_height = [](void *data) { return static_cast<ImageSource *>(data)->height.load(); };
+    info.update = [](void *data, obs_data_t *settings) {
+        auto *s = static_cast<ImageSource *>(data);
+        if (obs_data_has_user_value(settings, "width")) s->width = uint32_t(obs_data_get_int(settings, "width"));
+        if (obs_data_has_user_value(settings, "height")) s->height = uint32_t(obs_data_get_int(settings, "height"));
+    };
     info.video_render = [](void *data, gs_effect_t *effect) {
         auto *s = static_cast<ImageSource *>(data); gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), s->texture);
-        gs_draw_sprite(s->texture, 0, s->image.width, s->image.height);
+        gs_draw_sprite(s->texture, 0, s->width.load(), s->height.load());
     };
     obs_register_source(&info);
     obs_data_t *data = obs_data_create(); obs_data_set_string(data, "path", argv[4]);
     auto *source = obs_source_create_private("rmbg_test_image", "Test input", data); obs_data_release(data);
     data = obs_data_create(); obs_data_set_string(data, "model_path", argv[3]); obs_data_set_string(data, "device", argv[6]);
     obs_data_set_int(data, "stale_ms", 10000);
+    if (argc >= 10) {
+        obs_data_set_int(data, "max_fps", std::stoi(argv[7]));
+        obs_data_set_double(data, "smoothing", std::stod(argv[8]));
+    }
     auto *filter = obs_source_create_private("obs_rmbg_filter", "Test removal", data); obs_data_release(data);
     if (!source || !filter) { if (source) obs_source_release(source); if (filter) obs_source_release(filter); obs_shutdown(); return 6; }
     obs_source_filter_add(source, filter);
     // A scene scales the input to the output canvas, exercising the normal filter chain.
     auto *scene = obs_scene_create_private("RMBG test scene");
     auto *item = obs_scene_add(scene, source);
+    const auto original_width = obs_source_get_width(source), original_height = obs_source_get_height(source);
     vec2 scale; scale.x = 640.0f / obs_source_get_width(source); scale.y = 360.0f / obs_source_get_height(source);
     obs_sceneitem_set_scale(item, &scale);
     Capture captured; captured.image = {640, 360, std::vector<uint8_t>(640 * 360 * 4)};
@@ -92,6 +111,23 @@ int main(int argc, char **argv)
         if (success || error) break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (success && measure_seconds) {
+        calldata_t before{}, after{};
+        proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &before);
+        const auto start = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(measure_seconds));
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &after);
+        const auto masks = calldata_int(&after, "completed") - calldata_int(&before, "completed");
+        const auto frames = calldata_int(&after, "masked_frames") - calldata_int(&before, "masked_frames");
+        const double total_age = calldata_float(&after, "mask_age_sum_ms") - calldata_float(&before, "mask_age_sum_ms");
+        std::cout << "Benchmark: max_fps=" << argv[7] << "; smoothing=" << argv[8]
+                  << "; mask_updates_per_second=" << masks / elapsed << "; masked_video_fps=" << frames / elapsed
+                  << "; mean_displayed_mask_age_ms=" << (frames ? total_age / frames : 0) << '\n';
+        std::cout << calldata_string(&after, "status") << '\n';
+        success = masks > 0 && frames > 0 && calldata_bool(&after, "ready");
+        calldata_free(&before); calldata_free(&after);
+    }
     if (success) {
         std::lock_guard<std::mutex> lock(captured.mutex);
         image_io::write(argv[5], captured.image);
@@ -100,6 +136,57 @@ int main(int argc, char **argv)
         for (size_t i = 3; i < captured.image.rgba.size(); i += 4) { transparent += captured.image.rgba[i] < 20; opaque += captured.image.rgba[i] > 235; }
         std::cout << "Captured " << captured.frames << " frames; transparent=" << transparent << "; opaque=" << opaque << '\n';
         success = transparent > 500 && opaque > 500;
+    }
+    if (success && argc == 11) {
+        auto snapshot = [&] {
+            calldata_t params{};
+            proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &params);
+            return params;
+        };
+        auto wait_for = [&](int64_t completed, bool rvm, uint32_t width, uint32_t height) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                auto params = snapshot();
+                const bool good = calldata_bool(&params, "ready") && calldata_bool(&params, "is_rvm") == rvm &&
+                    calldata_int(&params, "completed") >= completed + 3 && calldata_int(&params, "mask_width") == width &&
+                    calldata_int(&params, "mask_height") == height && (!rvm || calldata_int(&params, "recurrent_frames") >= 2);
+                calldata_free(&params);
+                if (good) return true;
+            }
+            auto params = snapshot();
+            std::cerr << "Timed out waiting for model: " << calldata_string(&params, "status")
+                      << "; mask=" << calldata_int(&params, "mask_width") << 'x' << calldata_int(&params, "mask_height")
+                      << "; completed=" << calldata_int(&params, "completed") << '\n';
+            calldata_free(&params);
+            return false;
+        };
+        auto before = snapshot();
+        const bool initial_rvm = calldata_bool(&before, "is_rvm");
+        calldata_free(&before);
+        for (const auto dimensions : {std::pair<uint32_t, uint32_t>{640, 360}, {360, 640}, {original_width, original_height}}) {
+            before = snapshot(); const auto completed = calldata_int(&before, "completed"); calldata_free(&before);
+            data = obs_data_create(); obs_data_set_int(data, "width", dimensions.first); obs_data_set_int(data, "height", dimensions.second);
+            obs_source_update(source, data); obs_data_release(data);
+            const double factor = std::min(1.0, 1280.0 / std::max(dimensions.first, dimensions.second));
+            const auto width = initial_rvm ? uint32_t(std::lround(dimensions.first * factor)) : 1024u;
+            const auto height = initial_rvm ? uint32_t(std::lround(dimensions.second * factor)) : 1024u;
+            const bool resized = wait_for(completed, initial_rvm, width, height);
+            std::cout << "Source resize " << dimensions.first << 'x' << dimensions.second << ": " << (resized ? "passed" : "FAILED") << '\n';
+            success = success && resized;
+        }
+        // The switch fixture is the opposite model family; switch back as well.
+        for (const auto model : {std::pair<const char *, bool>{argv[10], !initial_rvm}, {argv[3], initial_rvm}}) {
+            before = snapshot(); const auto completed = calldata_int(&before, "completed"); calldata_free(&before);
+            data = obs_data_create(); obs_data_set_string(data, "model_path", model.first);
+            obs_source_update(filter, data); obs_data_release(data);
+            const double factor = std::min(1.0, 1280.0 / std::max(original_width, original_height));
+            const auto width = model.second ? uint32_t(std::lround(original_width * factor)) : 1024u;
+            const auto height = model.second ? uint32_t(std::lround(original_height * factor)) : 1024u;
+            const bool switched = wait_for(completed, model.second, width, height);
+            std::cout << "Switch to " << (model.second ? "RVM" : "RMBG") << ": " << (switched ? "passed" : "FAILED") << '\n';
+            success = success && switched;
+        }
     }
     // Exercise missing-model fail-open behavior without restarting OBS.
     data = obs_data_create(); obs_data_set_string(data, "model_path", "/nonexistent/rmbg.onnx");

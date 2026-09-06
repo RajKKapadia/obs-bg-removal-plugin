@@ -10,8 +10,12 @@ namespace rmbg {
 struct WorkerStatus {
     bool ready = false, busy = false;
     uint32_t width = 0, height = 0;
+    ModelKind kind = ModelKind::RMBG;
+    uint32_t capture_limit = 1280;
     uint64_t generation = 0, completed = 0;
     double inference_ms = 0;
+    uint64_t recurrent_frames = 0;
+    bool recurrent_on_gpu = false;
     std::string message = "Waiting for model";
 };
 class Worker {
@@ -30,7 +34,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool stopping_ = false, reload_ = false, configured_ = false;
-    float smoothing_ = 0.15f;
+    float smoothing_ = 0.0f;
     ModelConfig requested_;
     WorkerStatus status_;
     std::optional<Frame> pending_;

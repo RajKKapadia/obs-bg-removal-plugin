@@ -1,0 +1,13 @@
+Robust Video Matting (RVM)
+Authors: Shanchuan Lin, Linjie Yang, Imran Saleemi, Soumyadip Sengupta
+Official source: https://github.com/PeterL1n/RobustVideoMatting
+Model release: v1.0.0
+Upstream license: GPL-3.0 (see LICENSE in this directory)
+License source revision: 53d74c6826735f01f4406b5ca9075eee27bec094
+
+The plugin loads separately downloaded ONNX weights. Model downloads are optional.
+The project's own plugin source is covered by its separate LICENSE and COPYING.
+
+SHA256 pins recorded from the official release downloads:
+rvm_mobilenetv3_fp32.onnx: 88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828
+rvm_mobilenetv3_fp16.onnx: 6a0d5ce6cc17702613be548559879b4521ed424cfe14ddc48d1acaa44d616f64

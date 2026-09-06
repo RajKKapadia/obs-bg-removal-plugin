@@ -21,6 +21,7 @@ void Worker::configure(ModelConfig config, bool force)
         status_.ready = false;
         status_.message = "Loading model; original source visible";
         status_.width = status_.height = 0;
+        status_.recurrent_frames = 0; status_.recurrent_on_gpu = false;
         mask_.reset(); pending_.reset(); reload_ = true;
     }
     cv_.notify_one();
@@ -34,8 +35,9 @@ bool Worker::submit(Frame frame)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // At most one in-flight frame. Never build a queue of outdated video.
-        if (stopping_ || !status_.ready || status_.busy || pending_ || frame.generation != status_.generation)
+        // Inference may run while capture fills this single replaceable slot.
+        // An overloaded worker always takes the newest waiting frame next.
+        if (stopping_ || !status_.ready || frame.generation != status_.generation)
             return false;
         pending_ = std::move(frame);
         status_.busy = true;
@@ -80,14 +82,16 @@ void Worker::run()
                 if (generation != status_.generation) continue;
                 status_.ready = true; status_.busy = false;
                 status_.width = model->width(); status_.height = model->height();
-                status_.message = "Ready: " + model->backend();
+                status_.kind = model->kind(); status_.capture_limit = model->capture_limit();
+                status_.message = "Ready: " + model->backend() + "; model: " + model->label();
                 if (!model->warning().empty()) status_.message += ". " + model->warning();
                 continue;
             }
             if (!frame || !model) continue;
             auto mask = std::make_shared<Mask>(model->run(*frame));
             // Smoothing is expressed at 30 Hz so slow inference doesn't add seconds of lag.
-            if (previous && previous->generation == generation && previous->pixels.size() == mask->pixels.size() &&
+            if (smoothing > 0 && (!mask->direct_alpha || mask->recurrent_frames > 1) && previous && previous->generation == generation &&
+                previous->width == mask->width && previous->height == mask->height && previous->pixels.size() == mask->pixels.size() &&
                 previous->source_width == mask->source_width && previous->source_height == mask->source_height &&
                 mask->timestamp_ns > previous->timestamp_ns && mask->timestamp_ns - previous->timestamp_ns < 1000000000ULL) {
                 const double elapsed = (mask->timestamp_ns - previous->timestamp_ns) / 1e9;
@@ -97,8 +101,10 @@ void Worker::run()
             }
             std::lock_guard<std::mutex> lock(mutex_);
             if (generation != status_.generation) continue;
-            status_.busy = false;
+            status_.busy = pending_.has_value();
             status_.inference_ms = mask->inference_ms;
+            status_.width = mask->width; status_.height = mask->height;
+            status_.recurrent_frames = mask->recurrent_frames; status_.recurrent_on_gpu = mask->recurrent_on_gpu;
             ++status_.completed;
             mask_ = std::move(mask);
         } catch (const std::exception &e) {

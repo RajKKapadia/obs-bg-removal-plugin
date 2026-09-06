@@ -1,4 +1,5 @@
 #include "worker.hpp"
+#include "capture-schedule.hpp"
 #include <obs-module.h>
 #include <graphics/vec4.h>
 #include <algorithm>
@@ -9,7 +10,7 @@
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-rmbg", "en-US")
-MODULE_EXPORT const char *obs_module_description(void) { return "Local RMBG-1.4 background removal with ONNX Runtime"; }
+MODULE_EXPORT const char *obs_module_description(void) { return "Local RMBG-1.4 and RVM background removal with ONNX Runtime"; }
 MODULE_EXPORT const char *obs_module_author(void) { return "obs-rmbg contributors"; }
 
 namespace {
@@ -17,6 +18,10 @@ struct Settings {
     int max_fps = 15, stale_ms = 2000;
     float threshold = 0.5f, softness = 0.5f;
     bool preview = false;
+};
+struct RenderStats {
+    uint64_t masked_frames = 0;
+    double mask_age_ms = 0, mask_age_sum_ms = 0;
 };
 class Filter {
 public:
@@ -48,6 +53,8 @@ public:
         const std::string device = obs_data_get_string(data, "device");
         model.device = device == "cpu" ? rmbg::Device::CPU : device == "cuda" ? rmbg::Device::CUDA : rmbg::Device::Auto;
         model.threads = int(std::clamp<int64_t>(obs_data_get_int(data, "threads"), 1, 32));
+        model.rvm_max_size = uint32_t(std::clamp<int64_t>(obs_data_get_int(data, "rvm_max_size"), 320, 1920));
+        model.rvm_downsample = float(obs_data_get_double(data, "rvm_downsample"));
         Settings settings;
         settings.max_fps = int(std::clamp<int64_t>(obs_data_get_int(data, "max_fps"), 1, 60));
         settings.stale_ms = int(std::clamp<int64_t>(obs_data_get_int(data, "stale_ms"), 250, 10000));
@@ -60,6 +67,10 @@ public:
     }
     obs_source_t *source() const { return source_; }
     rmbg::WorkerStatus worker_status() const { return worker_.status(); }
+    RenderStats render_stats() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_); return render_stats_;
+    }
     std::string status() const
     {
         auto s = worker_.status();
@@ -67,8 +78,11 @@ public:
         text << s.message;
         if (s.completed) text << ". Last processing: " << std::fixed << std::setprecision(1) << s.inference_ms
                               << " ms; masks completed: " << s.completed;
+        if (s.recurrent_frames) text << "; recurrent frames: " << s.recurrent_frames
+                                    << " (state on " << (s.recurrent_on_gpu ? "GPU" : "CPU") << ")";
         auto mask = worker_.latest();
         std::lock_guard<std::mutex> lock(mutex_);
+        if (render_stats_.masked_frames) text << "; mask age: " << render_stats_.mask_age_ms << " ms";
         if (!render_error_.empty()) text << ". " << render_error_;
         if (mask && rmbg::monotonic_ns() - mask->timestamp_ns > uint64_t(settings_.stale_ms) * 1000000)
             text << ". Mask stale; original source visible";
@@ -108,18 +122,17 @@ public:
                     uint8_t *bytes = nullptr; uint32_t stride = 0;
                     if (gs_stagesurface_map(stage_, &bytes, &stride)) {
                         // Allocate before mapping below; memcpy cannot throw while GPU memory is mapped.
-                        for (uint32_t y = 0; y < state.height; ++y)
-                            std::memcpy(staged_frame_.rgba.data() + size_t(y) * state.width * 4,
-                                        bytes + size_t(y) * stride, size_t(state.width) * 4);
+                        for (uint32_t y = 0; y < staged_frame_.height; ++y)
+                            std::memcpy(staged_frame_.rgba.data() + size_t(y) * staged_frame_.width * 4,
+                                        bytes + size_t(y) * stride, size_t(staged_frame_.width) * 4);
                         gs_stagesurface_unmap(stage_);
                         worker_.submit(std::move(staged_frame_));
                     } else error("GPU readback failed; original source used until a fresh mask is available");
                 }
             }
             state = worker_.status();
-            if (state.ready && !state.busy && now >= next_capture_) {
+            if (state.ready && capture_schedule_.due(tick, unsigned(settings.max_fps))) {
                 capture_frame(state, width, height, now);
-                next_capture_ = now + 1000000000ULL / uint64_t(settings.max_fps);
             }
         }
         const auto mask = worker_.latest();
@@ -128,6 +141,9 @@ public:
             obs_source_skip_video_filter(source_); return;
         }
         if (mask != uploaded_mask_) {
+            if (mask_texture_ && (gs_texture_get_width(mask_texture_) != mask->width || gs_texture_get_height(mask_texture_) != mask->height)) {
+                gs_texture_destroy(mask_texture_); mask_texture_ = nullptr;
+            }
             if (!mask_texture_) mask_texture_ = gs_texture_create(mask->width, mask->height, GS_R8, 1, nullptr, GS_DYNAMIC);
             if (!mask_texture_) throw std::runtime_error("Could not allocate GPU mask texture");
             gs_texture_set_image(mask_texture_, mask->pixels.data(), mask->width, false);
@@ -138,21 +154,33 @@ public:
         gs_effect_set_float(gs_effect_get_param_by_name(effect_, "threshold"), settings.threshold);
         gs_effect_set_float(gs_effect_get_param_by_name(effect_, "softness"), settings.softness);
         gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "preview_mask"), settings.preview);
+        gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "direct_alpha"), mask->direct_alpha);
         obs_source_process_filter_end(source_, effect_, width, height);
+        if (tick != last_stats_tick_) {
+            last_stats_tick_ = tick;
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++render_stats_.masked_frames;
+            render_stats_.mask_age_ms = double(now - mask->timestamp_ns) / 1e6;
+            render_stats_.mask_age_sum_ms += render_stats_.mask_age_ms;
+        }
     }
 private:
     void capture_frame(const rmbg::WorkerStatus &state, uint32_t width, uint32_t height, uint64_t now)
     {
+        const auto size = rmbg::capture_size(state.kind, width, height, state.capture_limit);
         if (!capture_) capture_ = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-        if (!stage_) stage_ = gs_stagesurface_create(state.width, state.height, GS_RGBA);
+        if (stage_ && (gs_stagesurface_get_width(stage_) != size.width || gs_stagesurface_get_height(stage_) != size.height)) {
+            gs_stagesurface_destroy(stage_); stage_ = nullptr;
+        }
+        if (!stage_) stage_ = gs_stagesurface_create(size.width, size.height, GS_RGBA);
         if (!capture_ || !stage_) throw std::runtime_error("Could not allocate GPU capture buffers");
-        // All supported model inputs are 1024x1024; source aspect ratio is restored on output.
-        staged_frame_.width = state.width; staged_frame_.height = state.height;
+        // RMBG uses 1024x1024. RVM retains the source aspect ratio within its size limit.
+        staged_frame_.width = size.width; staged_frame_.height = size.height;
         staged_frame_.source_width = width; staged_frame_.source_height = height;
         staged_frame_.generation = state.generation; staged_frame_.timestamp_ns = now;
-        staged_frame_.rgba.resize(size_t(state.width) * state.height * 4);
+        staged_frame_.rgba.resize(size_t(size.width) * size.height * 4);
         gs_texrender_reset(capture_);
-        if (!gs_texrender_begin_with_color_space(capture_, state.width, state.height, GS_CS_SRGB))
+        if (!gs_texrender_begin_with_color_space(capture_, size.width, size.height, GS_CS_SRGB))
             throw std::runtime_error("Could not begin source capture");
         const bool linear = gs_set_linear_srgb(false);
         const bool srgb = gs_framebuffer_srgb_enabled();
@@ -175,6 +203,7 @@ private:
     rmbg::Worker worker_;
     mutable std::mutex mutex_;
     Settings settings_;
+    RenderStats render_stats_;
     std::string render_error_;
     gs_effect_t *effect_ = nullptr;
     gs_texrender_t *capture_ = nullptr;
@@ -183,7 +212,9 @@ private:
     std::shared_ptr<const rmbg::Mask> uploaded_mask_;
     rmbg::Frame staged_frame_;
     bool readback_pending_ = false;
-    uint64_t last_tick_ = 0, next_capture_ = 0;
+    rmbg::CaptureSchedule capture_schedule_;
+    uint64_t last_tick_ = 0;
+    uint64_t last_stats_tick_ = 0;
 };
 
 void defaults(obs_data_t *data)
@@ -192,9 +223,11 @@ void defaults(obs_data_t *data)
     obs_data_set_default_string(data, "model_path", path ? path : ""); bfree(path);
     obs_data_set_default_string(data, "device", "auto");
     obs_data_set_default_int(data, "threads", 2);
+    obs_data_set_default_int(data, "rvm_max_size", 1280);
+    obs_data_set_default_double(data, "rvm_downsample", 0);
     obs_data_set_default_int(data, "max_fps", 15);
     obs_data_set_default_int(data, "stale_ms", 2000);
-    obs_data_set_default_double(data, "smoothing", 0.15);
+    obs_data_set_default_double(data, "smoothing", 0.0);
     obs_data_set_default_double(data, "threshold", 0.5);
     obs_data_set_default_double(data, "softness", 0.5);
     obs_data_set_default_bool(data, "preview", false);
@@ -208,6 +241,14 @@ void status_proc(void *data, calldata_t *params)
         calldata_set_int(params, "completed", state.completed);
         calldata_set_float(params, "inference_ms", state.inference_ms);
         calldata_set_bool(params, "ready", state.ready);
+        calldata_set_int(params, "recurrent_frames", state.recurrent_frames);
+        calldata_set_bool(params, "recurrent_on_gpu", state.recurrent_on_gpu);
+        calldata_set_bool(params, "is_rvm", state.kind == rmbg::ModelKind::RVM);
+        calldata_set_int(params, "mask_width", state.width); calldata_set_int(params, "mask_height", state.height);
+        const auto render = filter->render_stats();
+        calldata_set_int(params, "masked_frames", render.masked_frames);
+        calldata_set_float(params, "mask_age_ms", render.mask_age_ms);
+        calldata_set_float(params, "mask_age_sum_ms", render.mask_age_sum_ms);
     } catch (...) { calldata_set_string(params, "status", "Unable to read filter status"); }
 }
 void *create(obs_data_t *data, obs_source_t *source)
@@ -216,7 +257,7 @@ void *create(obs_data_t *data, obs_source_t *source)
         auto filter = std::make_unique<Filter>(source);
         filter->update(data);
         proc_handler_add(obs_source_get_proc_handler(source),
-            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready)", status_proc, filter.get());
+            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready, out int masked_frames, out float mask_age_ms, out float mask_age_sum_ms, out int recurrent_frames, out bool recurrent_on_gpu, out bool is_rvm, out int mask_width, out int mask_height)", status_proc, filter.get());
         return filter.release();
     } catch (const std::exception &e) { blog(LOG_ERROR, "[obs-rmbg] Creation failed: %s", e.what()); return nullptr; }
 }
@@ -258,6 +299,19 @@ obs_properties_t *properties(void *data)
     obs_properties_add_float_slider(props, "smoothing", obs_module_text("Smoothing"), 0, 0.95, 0.05);
     obs_properties_add_float_slider(props, "threshold", obs_module_text("Threshold"), 0, 1, 0.01);
     obs_properties_add_float_slider(props, "softness", obs_module_text("Softness"), 0.001, 0.5, 0.01);
+    auto *rvm = obs_properties_create();
+    auto *size = obs_properties_add_list(rvm, "rvm_max_size", obs_module_text("RVMMaxSize"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(size, "640", 640);
+    obs_property_list_add_int(size, "1280", 1280);
+    obs_property_list_add_int(size, "1920", 1920);
+    // Use a list so every value is valid, including the separate automatic mode.
+    auto *ratio = obs_properties_add_list(rvm, "rvm_downsample", obs_module_text("RVMDownsample"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_FLOAT);
+    obs_property_list_add_float(ratio, obs_module_text("RVMAuto"), 0);
+    for (const double value : {0.125, 0.25, 0.375, 0.5, 0.6, 0.75, 1.0}) {
+        std::ostringstream label; label << value;
+        obs_property_list_add_float(ratio, label.str().c_str(), value);
+    }
+    obs_properties_add_group(props, "rvm_options", obs_module_text("RVMOptions"), OBS_GROUP_NORMAL, rvm);
     obs_properties_add_int_slider(props, "stale_ms", obs_module_text("StaleTimeout"), 250, 10000, 250);
     obs_properties_add_bool(props, "preview", obs_module_text("Preview"));
     auto *filter = static_cast<Filter *>(data);
@@ -283,6 +337,6 @@ bool obs_module_load(void)
     info.get_properties = properties;
     info.video_render = render;
     obs_register_source(&info);
-    blog(LOG_INFO, "[obs-rmbg] Loaded v0.1.0 (ONNX Runtime %s)", Ort::GetVersionString().c_str());
+    blog(LOG_INFO, "[obs-rmbg] Loaded v0.2.0 (ONNX Runtime %s)", Ort::GetVersionString().c_str());
     return true;
 }
