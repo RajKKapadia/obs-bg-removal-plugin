@@ -83,6 +83,20 @@ template<class T> std::vector<uint8_t> alpha_mask_impl(const T *data, size_t siz
 std::vector<uint8_t> alpha_mask(const float *data, size_t size) { return alpha_mask_impl(data, size); }
 std::vector<uint8_t> alpha_mask(const Ort::Float16_t *data, size_t size) { return alpha_mask_impl(data, size); }
 
+template<class T> std::vector<uint8_t> foreground_rgba_impl(const T *data, size_t pixels)
+{
+    if (!data || !pixels) throw std::invalid_argument("Empty foreground image");
+    std::vector<uint8_t> rgba(pixels * 4, 255);
+    for (size_t i = 0; i < pixels; ++i) for (size_t c = 0; c < 3; ++c) {
+        const float value = float(data[c * pixels + i]);
+        if (!std::isfinite(value)) throw std::runtime_error("Model produced non-finite foreground colors");
+        rgba[i * 4 + c] = uint8_t(std::lround(std::clamp(value, 0.0f, 1.0f) * 255));
+    }
+    return rgba;
+}
+std::vector<uint8_t> foreground_rgba(const float *data, size_t pixels) { return foreground_rgba_impl(data, pixels); }
+std::vector<uint8_t> foreground_rgba(const Ort::Float16_t *data, size_t pixels) { return foreground_rgba_impl(data, pixels); }
+
 namespace {
 struct TensorSpec { ONNXTensorElementDataType type; std::vector<int64_t> shape; };
 std::map<std::string, TensorSpec> tensor_specs(const Ort::Session &session, bool inputs)
@@ -158,6 +172,11 @@ Model::Model(const ModelConfig &config) : config_(config)
         const auto &src = inputs.at("src");
         require_image(src, 3, "RVM src");
         require_image(outputs.at("pha"), 1, "RVM pha");
+        if (config.rvm_foreground) {
+            if (!outputs.count("fgr")) throw std::runtime_error("RVM model has no foreground color output");
+            require_image(outputs.at("fgr"), 3, "RVM fgr");
+            if (outputs.at("fgr").type != src.type) throw std::runtime_error("RVM foreground precision must match src");
+        }
         if (src.shape[2] != -1 || src.shape[3] != -1 || outputs.at("pha").type != src.type)
             throw std::runtime_error("Use the official RVM ONNX export with dynamic spatial dimensions");
         const auto &ratio = inputs.at("downsample_ratio");
@@ -212,7 +231,7 @@ void Model::reset_recurrence()
     recurrent_frames_ = 0;
 }
 
-Ort::Value Model::run_rvm(const Frame &frame, const Ort::Value &input)
+Ort::Value Model::run_rvm(const Frame &frame, const Ort::Value &input, Ort::Value &foreground)
 {
     if (!recurrent_frames_ || !continues_sequence(previous_frame_, frame)) reset_recurrence();
     float ratio = config_.rvm_downsample > 0 ? config_.rvm_downsample : std::min(1.0f, 480.0f / std::max(frame.width, frame.height));
@@ -230,12 +249,15 @@ Ort::Value Model::run_rvm(const Frame &frame, const Ort::Value &input)
         binding.BindInput(("r" + std::to_string(i + 1) + "i").c_str(), recurrent_[i]);
         binding.BindOutput(("r" + std::to_string(i + 1) + "o").c_str(), state_memory);
     }
+    if (config_.rvm_foreground) binding.BindOutput("fgr", memory_);
     binding.SynchronizeInputs();
     session_.Run(Ort::RunOptions{nullptr}, binding);
     binding.SynchronizeOutputs();
     auto outputs = binding.GetOutputValues();
-    if (outputs.size() != 5) throw std::runtime_error("RVM did not return alpha and four recurrent states");
+    if (outputs.size() != (config_.rvm_foreground ? 6u : 5u))
+        throw std::runtime_error("RVM did not return the requested outputs");
     for (size_t i = 0; i < recurrent_.size(); ++i) recurrent_[i] = std::move(outputs[i + 1]);
+    if (config_.rvm_foreground) foreground = std::move(outputs[5]);
     ++recurrent_frames_;
     previous_frame_.width = frame.width; previous_frame_.height = frame.height;
     previous_frame_.source_width = frame.source_width; previous_frame_.source_height = frame.source_height;
@@ -252,8 +274,8 @@ Mask Model::run(const Frame &frame)
         throw std::invalid_argument("Frame dimensions do not match the model capture size (RVM requires at least 16 pixels per side)");
     const auto started = monotonic_ns();
     auto tensor = input_tensor(frame);
-    Ort::Value result{nullptr};
-    if (kind_ == ModelKind::RVM) result = run_rvm(frame, tensor);
+    Ort::Value result{nullptr}, foreground{nullptr};
+    if (kind_ == ModelKind::RVM) result = run_rvm(frame, tensor, foreground);
     else {
         const char *inputs[] = {input_name_.c_str()}, *outputs[] = {output_name_.c_str()};
         auto values = session_.Run(Ort::RunOptions{nullptr}, inputs, &tensor, 1, outputs, 1);
@@ -268,6 +290,7 @@ Mask Model::run(const Frame &frame)
     mask.width = frame.width; mask.height = frame.height;
     mask.source_width = frame.source_width; mask.source_height = frame.source_height;
     mask.timestamp_ns = frame.timestamp_ns; mask.generation = frame.generation;
+    mask.capture_id = frame.capture_id;
     const size_t count = size_t(frame.width) * frame.height;
     mask.direct_alpha = kind_ == ModelKind::RVM;
     std::vector<float> expanded;
@@ -286,6 +309,16 @@ Mask Model::run(const Frame &frame)
     } else if (result_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) alpha = result.GetTensorData<float>();
     else throw std::runtime_error("Expected floating-point mask output");
     if (alpha) mask.pixels = mask.direct_alpha ? alpha_mask(alpha, count) : normalize_mask(alpha, count);
+    if (foreground) {
+        const auto info = foreground.GetTensorTypeAndShapeInfo();
+        if (info.GetShape() != std::vector<int64_t>{1, 3, frame.height, frame.width} || info.GetElementType() != input_type_)
+            throw std::runtime_error("Unexpected RVM foreground dimensions or precision");
+        mask.foreground_rgba = input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+            ? foreground_rgba(foreground.GetTensorData<Ort::Float16_t>(), count)
+            : foreground_rgba(foreground.GetTensorData<float>(), count);
+    }
+    if (kind_ == ModelKind::RVM)
+        mask.downsample_ratio = config_.rvm_downsample > 0 ? config_.rvm_downsample : std::min(1.0f, 480.0f / std::max(frame.width, frame.height));
     mask.recurrent_frames = recurrent_frames_;
     mask.recurrent_on_gpu = kind_ == ModelKind::RVM && recurrent_[0].GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU;
     mask.inference_ms = (monotonic_ns() - started) / 1e6;

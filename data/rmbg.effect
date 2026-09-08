@@ -5,6 +5,8 @@ uniform float threshold;
 uniform float softness;
 uniform bool preview_mask;
 uniform bool direct_alpha;
+uniform texture2d foreground_colors;
+uniform bool use_foreground;
 
 sampler_state linear_sampler {
     Filter = Linear;
@@ -33,7 +35,10 @@ float4 PSDefault(Vertex v) : TARGET
     if (preview_mask)
         return float4(coverage, coverage, coverage, 1.0);
     // OBS textures use premultiplied alpha: multiply RGB and alpha together.
-    return image.Sample(linear_sampler, v.uv) * coverage;
+    float4 source = image.Sample(linear_sampler, v.uv);
+    if (use_foreground)
+        source.rgb = foreground_colors.Sample(linear_sampler, v.uv).rgb * source.a;
+    return source * coverage;
 }
 
 technique Draw {

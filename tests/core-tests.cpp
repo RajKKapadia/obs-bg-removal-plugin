@@ -9,6 +9,27 @@ void require(bool condition, const char *message) { if (!condition) throw std::r
 int main()
 {
     try {
+        rmbg::RollingMetric metric;
+        metric.reset(1000000000ULL);
+        for (uint64_t i = 1; i <= 100; ++i) metric.add(1000000000ULL + i * 10000000ULL, double(i));
+        auto summary = metric.summary(2000000000ULL);
+        require(summary.count == 100 && summary.mean == 50.5 && summary.p95 == 95 && summary.rate == 100,
+                "Rolling diagnostics use elapsed window time and nearest-rank p95");
+        require(metric.summary(8000000000ULL).count == 0, "Idle metrics expire without new samples");
+        for (uint64_t i = 0; i < 5000; ++i) metric.add(9000000000ULL + i, 1);
+        require(metric.stored() == rmbg::RollingMetric::capacity, "Statistics storage must stay bounded under excessive event rates");
+        metric.add(1000000000ULL, 2);
+        require(metric.stored() == 1 && metric.summary(1000000001ULL).mean == 2, "Reset on clock reversal");
+        const float colors[] = {1, 0.5f, 0, 0.25f, -1, 2};
+        require(rmbg::foreground_rgba(colors, 2) == std::vector<uint8_t>({255, 0, 0, 255, 128, 64, 255, 255}),
+                "Foreground colors convert planar RGB to clamped straight RGBA");
+        std::vector<Ort::Float16_t> half_colors;
+        for (float value : colors) half_colors.emplace_back(value);
+        require(rmbg::foreground_rgba(half_colors.data(), 2) == rmbg::foreground_rgba(colors, 2), "FP16 foreground conversion matches FP32");
+        const float bad_colors[] = {0, 1, std::numeric_limits<float>::infinity()};
+        bool bad_foreground = false;
+        try { rmbg::foreground_rgba(bad_colors, 1); } catch (const std::runtime_error &) { bad_foreground = true; }
+        require(bad_foreground, "Reject non-finite foreground output");
         // Non-divisor limits must not collapse to the next slower video cadence.
         for (const unsigned fps : {15u, 20u, 30u, 60u}) {
             rmbg::CaptureSchedule schedule;

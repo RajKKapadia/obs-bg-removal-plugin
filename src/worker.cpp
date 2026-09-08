@@ -1,6 +1,7 @@
 #include "worker.hpp"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 
 namespace rmbg {
 Worker::Worker() : thread_([this] { run(); }) {}
@@ -21,6 +22,9 @@ void Worker::configure(ModelConfig config, bool force)
         status_.ready = false;
         status_.message = "Loading model; original source visible";
         status_.width = status_.height = 0;
+        status_.backend.clear(); status_.precision.clear(); status_.model_file.clear(); status_.downsample_ratio = 0;
+        const auto now = monotonic_ns();
+        processing_.reset(now); queue_wait_.reset(now); replacements_.reset(now);
         status_.recurrent_frames = 0; status_.recurrent_on_gpu = false;
         mask_.reset(); pending_.reset(); reload_ = true;
     }
@@ -55,16 +59,30 @@ bool Worker::submit(Frame frame)
         // An overloaded worker always takes the newest waiting frame next.
         if (stopping_ || !status_.ready || frame.generation != status_.generation)
             return false;
-        if (pending_) recycle_rgba(pending_->rgba);
+        const auto now = monotonic_ns();
+        frame.submitted_ns = now;
+        if (pending_) {
+            recycle_rgba(pending_->rgba);
+            ++status_.replaced_frames;
+            replacements_.add(now);
+        }
         pending_ = std::move(frame);
         status_.busy = true;
     }
     cv_.notify_one();
     return true;
 }
-WorkerStatus Worker::status() const
+WorkerStatus Worker::status(bool diagnostics) const
 {
-    std::lock_guard<std::mutex> lock(mutex_); return status_;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto result = status_;
+    if (diagnostics) {
+        const auto now = monotonic_ns();
+        result.processing = processing_.summary(now);
+        result.queue_wait = queue_wait_.summary(now);
+        result.replacements = replacements_.summary(now);
+    }
+    return result;
 }
 std::shared_ptr<const Mask> Worker::latest() const
 {
@@ -101,11 +119,18 @@ void Worker::run()
                 status_.width = model->width(); status_.height = model->height();
                 status_.kind = model->kind(); status_.capture_limit = model->capture_limit();
                 status_.message = "Ready: " + model->backend() + "; model: " + model->label();
+                status_.backend = model->backend(); status_.precision = model->precision();
+                status_.model_file = std::filesystem::path(config.path).filename().string();
+                status_.downsample_ratio = 0;
+                const auto now = monotonic_ns();
+                processing_.reset(now); queue_wait_.reset(now); replacements_.reset(now);
                 if (!model->warning().empty()) status_.message += ". " + model->warning();
                 continue;
             }
             if (!frame || !model) continue;
+            const double queue_ms = double(monotonic_ns() - frame->submitted_ns) / 1e6;
             auto mask = std::make_shared<Mask>(model->run(*frame));
+            mask->capture_id = frame->capture_id;
             mask->capture_token = frame->capture_token;
             // Smoothing is expressed at 30 Hz so slow inference doesn't add seconds of lag.
             if (!mask->capture_token && smoothing > 0 && (!mask->direct_alpha || mask->recurrent_frames > 1) && previous && previous->generation == generation &&
@@ -122,6 +147,9 @@ void Worker::run()
             if (generation != status_.generation) continue;
             status_.busy = pending_.has_value();
             status_.inference_ms = mask->inference_ms;
+            status_.downsample_ratio = mask->downsample_ratio;
+            const auto completed_at = monotonic_ns();
+            processing_.add(completed_at, mask->inference_ms); queue_wait_.add(completed_at, queue_ms);
             status_.width = mask->width; status_.height = mask->height;
             status_.recurrent_frames = mask->recurrent_frames; status_.recurrent_on_gpu = mask->recurrent_on_gpu;
             ++status_.completed;

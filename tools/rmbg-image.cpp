@@ -7,7 +7,7 @@
 int main(int argc, char **argv)
 {
     if (argc < 4) {
-        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO]\n";
+        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO] [--rvm-foreground 0|1]\n";
         return 2;
     }
     try {
@@ -22,11 +22,13 @@ int main(int argc, char **argv)
             else if (option == "--threads") config.threads = std::stoi(value);
             else if (option == "--rvm-max-size") config.rvm_max_size = std::stoul(value);
             else if (option == "--rvm-downsample") config.rvm_downsample = std::stof(value);
+            else if (option == "--rvm-foreground" && (value == "0" || value == "1")) config.rvm_foreground = value == "1";
             else throw std::runtime_error("Unknown option: " + option);
         }
         if (iterations < 1 || iterations > 1000) throw std::runtime_error("Iterations must be 1..1000");
         const auto source = image_io::read(argv[2]);
         rmbg::Model model(config);
+        if (config.rvm_foreground && model.kind() != rmbg::ModelKind::RVM) throw std::runtime_error("Foreground colors require RVM");
         const auto size = model.input_size(source.width, source.height);
         auto resized = image_io::resize(source, size.width, size.height);
         rmbg::Frame frame; frame.width = resized.width; frame.height = resized.height;
@@ -47,6 +49,9 @@ int main(int argc, char **argv)
                     (x + 0.5f) * mask.width / source.width - 0.5f, (y + 0.5f) * mask.height / source.height - 0.5f);
                 const size_t i = (size_t(y) * source.width + x) * 4;
                 output.rgba[i + 3] = uint8_t((unsigned(alpha) * source.rgba[i + 3] + 127) / 255);
+                if (!mask.foreground_rgba.empty()) for (size_t c = 0; c < 3; ++c)
+                    output.rgba[i + c] = image_io::sample(mask.foreground_rgba.data(), mask.width, mask.height, 4, c,
+                        (x + 0.5f) * mask.width / source.width - 0.5f, (y + 0.5f) * mask.height / source.height - 0.5f);
                 preview.rgba[i] = preview.rgba[i + 1] = preview.rgba[i + 2] = alpha; preview.rgba[i + 3] = 255;
             }
         }
