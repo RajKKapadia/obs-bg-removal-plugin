@@ -45,6 +45,10 @@ struct ReleaseOnExit {
 // This target links the real worker to a gated model double, allowing exact
 // concurrency checks without GPU timing, model downloads, or inference races.
 namespace rmbg {
+uint64_t monotonic_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 Model::Model(const ModelConfig &) { width_ = height_ = 1; backend_ = "test"; }
 Mask Model::run(const Frame &frame)
 {
@@ -103,6 +107,10 @@ int main()
         await([&] { return !worker.status().busy; });
         require(worker.latest()->timestamp_ns == 3 && worker.status().completed == 2,
                 "Only the in-flight and newest pending frames should be processed");
+        const auto diagnostic = worker.status(true);
+        require(diagnostic.replaced_frames == 1 && diagnostic.replacements.count == 1 && diagnostic.processing.count == 2 &&
+                diagnostic.queue_wait.count == 2 && diagnostic.queue_wait.mean >= 0,
+                "Diagnostics count actual replacements and completions without counting rejected captures");
         require(worker.latest()->pixels[0] == 255, "Reusing capture storage must not corrupt in-flight pixels");
         require(!first_token.expired(), "A displayed pair pins its video after the worker publishes a replacement");
         displayed.reset();

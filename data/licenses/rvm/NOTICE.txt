@@ -11,3 +11,5 @@ The project's own plugin source is covered by its separate LICENSE and COPYING.
 SHA256 pins recorded from the official release downloads:
 rvm_mobilenetv3_fp32.onnx: 88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828
 rvm_mobilenetv3_fp16.onnx: 6a0d5ce6cc17702613be548559879b4521ed424cfe14ddc48d1acaa44d616f64
+rvm_resnet50_fp32.onnx: 25db300fcb6ee27f941a1b52c97856e8d1f13c7f35817f81a612f89af0e8a85c
+rvm_resnet50_fp16.onnx: a9266f5046411d604bbff38e18c54bf8c70d85d93bbc400564697590f5712738

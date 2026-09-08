@@ -35,6 +35,7 @@ int main(int argc, char **argv)
             return f;
         };
         const auto first = model.run(frame(1280, 720, 1000000000));
+        require(first.foreground_rgba.empty(), "Foreground output stays absent when disabled");
         const auto second = model.run(frame(1280, 720, 1033333333));
         require(first.direct_alpha && first.recurrent_frames == 1 && second.recurrent_frames == 2, "Recycle temporal state across frames");
         require(second.recurrent_on_gpu == (device == "cuda"), "Keep state on the selected device");
@@ -54,6 +55,20 @@ int main(int argc, char **argv)
         model.run(frame(720, 1280, 3166666666, 2));
         const auto rewind = model.run(frame(720, 1280, 3150000000, 2));
         require(rewind.recurrent_frames == 1 && difference(portrait, rewind) < 0.05, "A timestamp discontinuity resets state");
+        config.rvm_foreground = true;
+        rmbg::Model with_foreground(config);
+        auto color_frame = frame(1280, 720, 1000000000);
+        color_frame.capture_id = 42;
+        const auto color = with_foreground.run(color_frame);
+        require(color.foreground_rgba.size() == size_t(color.width) * color.height * 4 && color.capture_id == 42,
+                "Foreground RGB is full-sized and retains the alpha capture identity");
+        require(difference(first, color) < 0.05, "Requesting foreground colors must preserve alpha");
+        size_t varied = 0;
+        for (size_t i = 0; i < color.foreground_rgba.size(); i += 4) {
+            require(color.foreground_rgba[i + 3] == 255, "Model foreground output uses straight opaque RGB");
+            varied += color.foreground_rgba[i] != color.foreground_rgba[i + 1];
+        }
+        require(varied > 100, "Foreground output contains actual color values");
         std::cout << model.label() << ": temporal state, GPU residency, resize, generation and pause checks passed; temporal alpha change="
                   << temporal_change << "/255\n";
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }

@@ -1,4 +1,5 @@
 #include "../tools/png-image.hpp"
+#include "../tools/frame-sequence.hpp"
 #include <obs.h>
 #include <obs-nix-platform.h>
 #include <chrono>
@@ -6,32 +7,54 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 namespace {
+unsigned env_number(const char *name, unsigned fallback, unsigned low, unsigned high)
+{
+    const char *value = std::getenv(name);
+    const unsigned result = value ? unsigned(std::stoul(value)) : fallback;
+    if (result < low || result > high) throw std::runtime_error(std::string(name) + " is out of range");
+    return result;
+}
 struct ImageSource {
     image_io::Image image;
     gs_texture_t *texture = nullptr;
     std::atomic<uint32_t> width{0}, height{0};
     bool motion = false;
     uint64_t last_tick = 0, motion_frame = 0;
+    uint64_t origin = 0, last_source_index = UINT64_MAX;
+    unsigned source_fps = 30;
+    std::unique_ptr<image_io::SequenceReplay> replay;
+    std::atomic<uint64_t> underruns{0};
 };
+ImageSource *test_source = nullptr;
 void *create_image(obs_data_t *settings, obs_source_t *)
 {
     try {
-        auto *s = new ImageSource{image_io::read(obs_data_get_string(settings, "path")), nullptr};
+        auto owned = std::make_unique<ImageSource>();
+        auto *s = owned.get();
+        s->image = image_io::read(obs_data_get_string(settings, "path"));
         s->width = s->image.width; s->height = s->image.height;
         s->motion = std::getenv("RMBG_TEST_MOTION") != nullptr;
+        s->source_fps = env_number("RMBG_TEST_SOURCE_FPS", 30, 1, 240);
+        if (const auto *path = std::getenv("RMBG_TEST_SEQUENCE")) {
+            s->replay = std::make_unique<image_io::SequenceReplay>(path);
+            s->image = *s->replay->frame(0);
+            s->width = s->image.width; s->height = s->image.height;
+            s->motion = false;
+        }
         if (s->motion && (s->image.width < 64 || s->image.height < 64)) {
-            delete s;
             throw std::runtime_error("Motion test requires at least 64 pixels per side");
         }
         obs_enter_graphics(); const uint8_t *ptr = s->image.rgba.data();
-        s->texture = gs_texture_create(s->image.width, s->image.height, GS_RGBA, 1, &ptr, s->motion ? GS_DYNAMIC : 0);
-        obs_leave_graphics(); return s;
-    } catch (...) { return nullptr; }
+        s->texture = gs_texture_create(s->image.width, s->image.height, GS_RGBA, 1, &ptr, (s->motion || s->replay) ? GS_DYNAMIC : 0);
+        obs_leave_graphics(); test_source = s; return owned.release();
+    } catch (const std::exception &e) { std::cerr << "Source creation failed: " << e.what() << '\n'; return nullptr; }
 }
 struct Capture {
     std::mutex mutex;
@@ -55,9 +78,11 @@ void receive(void *data, video_data *frame)
         size_t opaque = 0, transparent = 0, mismatches = 0;
         for (size_t i = 0; i < c.image.rgba.size(); i += 4) {
             transparent += c.image.rgba[i + 3] < 20;
-            if (c.image.rgba[i + 3] > 240) {
+            const bool premult_test = std::getenv("RMBG_TEST_PREMULT") != nullptr;
+            if (premult_test ? (c.image.rgba[i + 3] > 120 && c.image.rgba[i + 3] < 136) : c.image.rgba[i + 3] > 240) {
                 ++opaque;
-                mismatches += c.image.rgba[i] < 200;
+                const size_t channel = std::getenv("RMBG_TEST_GREEN_FOREGROUND") ? 1 : 0;
+                mismatches += premult_test ? (std::abs(int(c.image.rgba[i + channel]) - int(c.image.rgba[i + 3])) > 2) : c.image.rgba[i + channel] < 200;
             }
         }
         if (transparent > 500 && opaque > 500) {
@@ -73,12 +98,13 @@ int main(int argc, char **argv)
     }
     const int measure_seconds = argc >= 10 ? std::stoi(argv[9]) : 0;
     if (argc >= 10 && (std::stoi(argv[7]) < 1 || std::stoi(argv[7]) > 60 ||
-                      std::stod(argv[8]) < 0 || std::stod(argv[8]) > 0.95 || measure_seconds < 1 || measure_seconds > 60)) return 2;
+                      std::stod(argv[8]) < 0 || std::stod(argv[8]) > 0.95 || measure_seconds < 1 || measure_seconds > 3600)) return 2;
     obs_set_nix_platform(OBS_NIX_PLATFORM_X11_EGL);
     if (!obs_startup("en-US", nullptr, nullptr)) return 3;
     obs_video_info video{};
-    video.graphics_module = "libobs-opengl"; video.fps_num = 30; video.fps_den = 1;
-    video.base_width = video.output_width = 640; video.base_height = video.output_height = 360;
+    video.graphics_module = "libobs-opengl"; video.fps_num = env_number("RMBG_TEST_OBS_FPS", 30, 1, 240); video.fps_den = 1;
+    video.base_width = video.output_width = env_number("RMBG_TEST_WIDTH", 640, 64, 3840);
+    video.base_height = video.output_height = env_number("RMBG_TEST_HEIGHT", 360, 64, 2160);
     video.output_format = VIDEO_FORMAT_BGRA; video.colorspace = VIDEO_CS_709; video.range = VIDEO_RANGE_FULL;
     video.gpu_conversion = false; video.scale_type = OBS_SCALE_BILINEAR;
     if (obs_reset_video(&video) != OBS_VIDEO_SUCCESS) { obs_shutdown(); return 4; }
@@ -98,16 +124,29 @@ int main(int argc, char **argv)
     info.video_render = [](void *data, gs_effect_t *effect) {
         auto *s = static_cast<ImageSource *>(data);
         const auto tick = obs_get_video_frame_time();
-        if (s->motion && tick != s->last_tick) {
+        if (!s->origin) s->origin = tick;
+        const uint64_t index = (tick - s->origin) * s->source_fps / 1000000000ULL;
+        if (s->replay && tick != s->last_tick && index != s->last_source_index) {
             s->last_tick = tick;
-            const auto left = (++s->motion_frame * 23) % (s->image.width - s->image.width / 3);
+            const auto next = s->replay->frame(index);
+            if (next) {
+                gs_texture_set_image(s->texture, next->rgba.data(), next->width * 4, false);
+                s->last_source_index = index;
+            } else ++s->underruns;
+        }
+        if (s->motion && tick != s->last_tick && index != s->last_source_index) {
+            s->last_tick = tick;
+            s->last_source_index = index;
+            const auto span = s->image.width - s->image.width / 3;
+            const auto position = (index * 23) % (span * 2);
+            const auto left = position < span ? position : span * 2 - position;
             for (uint32_t y = 0; y < s->image.height; ++y) for (uint32_t x = 0; x < s->image.width; ++x) {
                 const size_t i = (size_t(y) * s->image.width + x) * 4;
                 const bool foreground = x >= left && x < left + s->image.width / 3;
                 s->image.rgba[i] = foreground ? 255 : 0;
                 s->image.rgba[i + 1] = foreground ? 80 : 0;
                 s->image.rgba[i + 2] = foreground ? 0 : 255;
-                s->image.rgba[i + 3] = 255;
+                s->image.rgba[i + 3] = std::getenv("RMBG_TEST_PREMULT") ? 128 : 255;
             }
             gs_texture_set_image(s->texture, s->image.rgba.data(), s->image.width * 4, false);
         }
@@ -121,8 +160,10 @@ int main(int argc, char **argv)
     obs_data_set_int(data, "stale_ms", 10000);
     if (const auto *readback = std::getenv("RMBG_TEST_READBACK"))
         obs_data_set_bool(data, "immediate_readback", std::string(readback) != "deferred");
-    const bool match_video = std::getenv("RMBG_TEST_MATCH_VIDEO") != nullptr;
+    const bool match_video = std::getenv("RMBG_TEST_MATCH_VIDEO") != nullptr || std::getenv("RMBG_TEST_PRESET") != nullptr;
     obs_data_set_bool(data, "match_video", match_video);
+    obs_data_set_bool(data, "rvm_foreground", std::getenv("RMBG_TEST_FOREGROUND") != nullptr);
+    obs_data_set_int(data, "rvm_max_size", env_number("RMBG_TEST_RVM_SIZE", 1280, 320, 1920));
     if (argc >= 10) {
         obs_data_set_int(data, "max_fps", std::stoi(argv[7]));
         obs_data_set_double(data, "smoothing", std::stod(argv[8]));
@@ -134,10 +175,10 @@ int main(int argc, char **argv)
     auto *scene = obs_scene_create_private("RMBG test scene");
     auto *item = obs_scene_add(scene, source);
     const auto original_width = obs_source_get_width(source), original_height = obs_source_get_height(source);
-    vec2 scale; scale.x = 640.0f / obs_source_get_width(source); scale.y = 360.0f / obs_source_get_height(source);
+    vec2 scale; scale.x = float(video.output_width) / obs_source_get_width(source); scale.y = float(video.output_height) / obs_source_get_height(source);
     obs_sceneitem_set_scale(item, &scale);
-    Capture captured; captured.image = {640, 360, std::vector<uint8_t>(640 * 360 * 4)};
-    video_scale_info conversion{}; conversion.format = VIDEO_FORMAT_BGRA; conversion.width = 640; conversion.height = 360;
+    Capture captured; captured.image = {video.output_width, video.output_height, std::vector<uint8_t>(size_t(video.output_width) * video.output_height * 4)};
+    video_scale_info conversion{}; conversion.format = VIDEO_FORMAT_BGRA; conversion.width = video.output_width; conversion.height = video.output_height;
     conversion.colorspace = VIDEO_CS_709; conversion.range = VIDEO_RANGE_FULL;
     obs_add_raw_video_callback(&conversion, receive, &captured);
     obs_set_output_source(0, obs_scene_get_source(scene));
@@ -156,12 +197,49 @@ int main(int argc, char **argv)
         if (success || error) break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (success && std::getenv("RMBG_TEST_PRESET")) {
+        auto *props = obs_source_properties(filter);
+        auto *preset = obs_properties_get(props, "quality_preset");
+        data = obs_source_get_settings(filter);
+        const std::string model = obs_data_get_string(data, "model_path"), device = obs_data_get_string(data, "device");
+        obs_data_release(data);
+        success = preset && obs_property_enabled(preset) && obs_property_button_clicked(preset, nullptr);
+        data = obs_source_get_settings(filter);
+        success = success && obs_data_get_int(data, "max_fps") == 30 && obs_data_get_bool(data, "match_video") &&
+            obs_data_get_bool(data, "immediate_readback") && obs_data_get_int(data, "rvm_max_size") == 1920 &&
+            obs_data_get_double(data, "smoothing") == 0 && obs_data_get_double(data, "rvm_downsample") == 0 &&
+            obs_data_get_double(data, "threshold") == .5 && obs_data_get_double(data, "softness") == .5 &&
+            obs_data_get_int(data, "stale_ms") == 2000 && !obs_data_get_bool(data, "rvm_foreground") &&
+            model == obs_data_get_string(data, "model_path") && device == obs_data_get_string(data, "device");
+        obs_data_release(data); obs_properties_destroy(props);
+        std::cout << "Quality preset preserves model/device and applies exact settings: " << success << '\n';
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
     if (success && measure_seconds) {
         { std::lock_guard<std::mutex> lock(captured.mutex); captured.measure_motion = std::getenv("RMBG_TEST_MOTION") != nullptr; }
         calldata_t before{}, after{};
         proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &before);
         const auto start = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::seconds(measure_seconds));
+        std::ofstream csv(std::string(argv[5]) + ".timings.csv");
+        csv << "elapsed_s,mask_rate,pair_rate,processing_mean_ms,processing_p95_ms,queue_mean_ms,queue_p95_ms,age_mean_ms,age_p95_ms,replaced_window,repeated_window,cached_frames,cache_misses,rss_kib,source_underruns\n";
+        bool windows_pass = true;
+        for (int second = 1; second <= measure_seconds; ++second) {
+            std::this_thread::sleep_until(start + std::chrono::seconds(second));
+            calldata_t sample{};
+            proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &sample);
+            std::ifstream memory("/proc/self/status"); std::string line; uint64_t rss = 0;
+            while (std::getline(memory, line)) if (line.rfind("VmRSS:", 0) == 0) { std::istringstream value(line.substr(6)); value >> rss; }
+            csv << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            for (const auto *key : {"mask_rate", "pair_rate", "processing_mean_ms", "processing_p95_ms", "queue_mean_ms", "queue_p95_ms", "age_mean_ms", "age_p95_ms"}) csv << ',' << calldata_float(&sample, key);
+            for (const auto *key : {"replaced_window", "repeated_window", "cached_frames", "cache_misses"}) csv << ',' << calldata_int(&sample, key);
+            csv << ',' << rss << ',' << test_source->underruns.load() << '\n';
+            csv.flush();
+            if (second >= 10) windows_pass = windows_pass && calldata_bool(&sample, "ready") &&
+                calldata_float(&sample, "mask_rate") >= 29 && calldata_float(&sample, "age_p95_ms") < 75 &&
+                calldata_int(&sample, "cached_frames") <= 6;
+            if (second % 30 == 0) std::cout << "Progress " << second << " s: " << calldata_string(&sample, "status") << '\n' << std::flush;
+            calldata_free(&sample);
+        }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         proc_handler_call(obs_source_get_proc_handler(filter), "rmbg_status", &after);
         const auto masks = calldata_int(&after, "completed") - calldata_int(&before, "completed");
@@ -179,12 +257,33 @@ int main(int argc, char **argv)
                   << "; cached frames=" << calldata_int(&after, "cached_frames")
                   << "; cache misses=" << calldata_int(&after, "cache_misses") << '\n';
         success = masks > 0 && frames > 0 && calldata_bool(&after, "ready");
+        if (std::getenv("RMBG_TEST_ACCEPTANCE")) {
+            success = success && measure_seconds >= 10 && windows_pass;
+            std::cout << "30 FPS / p95 <75 ms acceptance windows: " << (windows_pass ? "passed" : "FAILED") << '\n';
+        }
+        if (test_source->replay) {
+            std::cout << "Sequence source underruns=" << test_source->underruns << "; decoder error=" << test_source->replay->error() << '\n';
+            success = success && test_source->replay->error().empty() && test_source->underruns == 0;
+        }
         if (match_video) success = success && matched == frames && calldata_int(&after, "cached_frames") <= 6;
+        if (std::getenv("RMBG_TEST_OVERLOAD")) {
+            const auto replacements = calldata_int(&after, "replaced_frames") - calldata_int(&before, "replaced_frames");
+            std::cout << "Overload replaced waiting frames=" << replacements << '\n';
+            success = success && replacements > 0 && masks / elapsed < std::stoi(argv[7]);
+        }
         if (std::getenv("RMBG_TEST_MOTION")) {
             std::lock_guard<std::mutex> lock(captured.mutex);
             captured.measure_motion = false;
             const double mismatch = captured.opaque_pixels ? double(captured.mismatch_pixels) / captured.opaque_pixels : 1;
             std::cout << "Motion frames=" << captured.motion_frames << "; mismatched foreground fraction=" << mismatch << '\n';
+            if (std::getenv("RMBG_TEST_PREMULT")) {
+                image_io::write(argv[5], captured.image);
+                for (size_t i = 0; i < captured.image.rgba.size(); i += 4) if (captured.image.rgba[i + 3] > 120 && captured.image.rgba[i + 3] < 136) {
+                    std::cout << "Half-transparent sample RGBA=" << int(captured.image.rgba[i]) << ',' << int(captured.image.rgba[i + 1])
+                              << ',' << int(captured.image.rgba[i + 2]) << ',' << int(captured.image.rgba[i + 3]) << '\n';
+                    break;
+                }
+            }
             // Live mode is a negative control: it must visibly mismatch the moving
             // foreground. Matched mode must preserve red foreground on every frame.
             success = success && captured.motion_frames >= 20 && (match_video ? mismatch < 0.001 : mismatch > 0.01);
@@ -196,7 +295,10 @@ int main(int argc, char **argv)
         image_io::write(argv[5], captured.image);
         filtered = captured.image;
         size_t transparent = 0, opaque = 0;
-        for (size_t i = 3; i < captured.image.rgba.size(); i += 4) { transparent += captured.image.rgba[i] < 20; opaque += captured.image.rgba[i] > 235; }
+        for (size_t i = 3; i < captured.image.rgba.size(); i += 4) {
+            transparent += captured.image.rgba[i] < 20;
+            opaque += std::getenv("RMBG_TEST_PREMULT") ? (captured.image.rgba[i] > 120 && captured.image.rgba[i] < 136) : captured.image.rgba[i] > 235;
+        }
         std::cout << "Captured " << captured.frames << " frames; transparent=" << transparent << "; opaque=" << opaque << '\n';
         success = transparent > 500 && opaque > 500;
     }
@@ -231,7 +333,7 @@ int main(int argc, char **argv)
             before = snapshot(); const auto completed = calldata_int(&before, "completed"); calldata_free(&before);
             data = obs_data_create(); obs_data_set_int(data, "width", dimensions.first); obs_data_set_int(data, "height", dimensions.second);
             obs_source_update(source, data); obs_data_release(data);
-            const double factor = std::min(1.0, 1280.0 / std::max(dimensions.first, dimensions.second));
+            const double factor = std::min(1.0, double(env_number("RMBG_TEST_RVM_SIZE", 1280, 320, 1920)) / std::max(dimensions.first, dimensions.second));
             const auto width = initial_rvm ? uint32_t(std::lround(dimensions.first * factor)) : 1024u;
             const auto height = initial_rvm ? uint32_t(std::lround(dimensions.second * factor)) : 1024u;
             const bool resized = wait_for(completed, initial_rvm, width, height);
@@ -243,7 +345,7 @@ int main(int argc, char **argv)
             before = snapshot(); const auto completed = calldata_int(&before, "completed"); calldata_free(&before);
             data = obs_data_create(); obs_data_set_string(data, "model_path", model.first);
             obs_source_update(filter, data); obs_data_release(data);
-            const double factor = std::min(1.0, 1280.0 / std::max(original_width, original_height));
+            const double factor = std::min(1.0, double(env_number("RMBG_TEST_RVM_SIZE", 1280, 320, 1920)) / std::max(original_width, original_height));
             const auto width = model.second ? uint32_t(std::lround(original_width * factor)) : 1024u;
             const auto height = model.second ? uint32_t(std::lround(original_height * factor)) : 1024u;
             const bool switched = wait_for(completed, model.second, width, height);
@@ -275,6 +377,43 @@ int main(int argc, char **argv)
             success = success && captured.motion_frames >= 20 && (matched ? mismatch < 0.001 : mismatch > 0.01);
         }
     }
+    if (success && std::getenv("RMBG_TEST_FOREGROUND_TOGGLE")) {
+        for (const bool colors : {false, true, false}) {
+            data = obs_data_create(); obs_data_set_bool(data, "rvm_foreground", colors);
+            obs_source_update(filter, data); obs_data_release(data);
+            std::this_thread::sleep_for(std::chrono::milliseconds(650));
+            std::lock_guard<std::mutex> lock(captured.mutex);
+            size_t count = 0, wrong = 0;
+            for (size_t i = 0; i < captured.image.rgba.size(); i += 4) if (captured.image.rgba[i + 3] > 240) {
+                ++count;
+                wrong += captured.image.rgba[i + (colors ? 1 : 0)] < 200;
+            }
+            success = success && count > 500 && wrong == 0;
+            std::cout << "Foreground toggle " << colors << ": opaque=" << count << "; incorrect=" << wrong << '\n';
+        }
+    }
+    if (success && std::getenv("RMBG_TEST_STALE")) {
+        data = obs_data_create(); obs_data_set_int(data, "max_fps", 1); obs_data_set_int(data, "stale_ms", 250);
+        obs_source_update(filter, data); obs_data_release(data);
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        {
+            std::lock_guard<std::mutex> lock(captured.mutex);
+            size_t nonopaque = 0;
+            for (size_t i = 3; i < captured.image.rgba.size(); i += 4) nonopaque += captured.image.rgba[i] < 250;
+            std::cout << "Stale-mask passthrough nonopaque pixels=" << nonopaque << '\n';
+            success = success && nonopaque == 0;
+        }
+        data = obs_data_create(); obs_data_set_int(data, "max_fps", 30); obs_data_set_int(data, "stale_ms", 10000);
+        obs_source_update(filter, data); obs_data_release(data);
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        {
+            std::lock_guard<std::mutex> lock(captured.mutex);
+            size_t transparent = 0;
+            for (size_t i = 3; i < captured.image.rgba.size(); i += 4) transparent += captured.image.rgba[i] < 20;
+            success = success && transparent > 500;
+            std::cout << "Fresh-mask recovery transparent pixels=" << transparent << '\n';
+        }
+    }
     // Exercise missing-model fail-open behavior without restarting OBS.
     data = obs_data_create(); obs_data_set_string(data, "model_path", "/nonexistent/rmbg.onnx");
     obs_source_update(filter, data); obs_data_release(data);
@@ -282,11 +421,12 @@ int main(int argc, char **argv)
     {
         std::lock_guard<std::mutex> lock(captured.mutex);
         size_t transparent = 0;
-        for (size_t i = 3; i < captured.image.rgba.size(); i += 4) transparent += captured.image.rgba[i] < 250;
+        for (size_t i = 3; i < captured.image.rgba.size(); i += 4)
+            transparent += std::getenv("RMBG_TEST_PREMULT") ? std::abs(int(captured.image.rgba[i]) - 128) > 2 : captured.image.rgba[i] < 250;
         std::cout << "Missing-model passthrough: nonopaque pixels=" << transparent << '\n';
         success = success && transparent == 0;
         image_io::write(std::string(argv[5]) + ".passthrough.png", captured.image);
-        if (!filtered.rgba.empty() && !std::getenv("RMBG_TEST_MOTION")) {
+        if (!filtered.rgba.empty() && !std::getenv("RMBG_TEST_MOTION") && !std::getenv("RMBG_TEST_FOREGROUND") && !std::getenv("RMBG_TEST_SEQUENCE")) {
             uint64_t difference = 0, samples = 0;
             for (size_t i = 0; i < filtered.rgba.size(); i += 4) {
                 if (filtered.rgba[i + 3] <= 250) continue;
