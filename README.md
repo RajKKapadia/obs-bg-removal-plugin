@@ -5,15 +5,45 @@ A native C++ OBS **Effect Filter** that runs BRIA RMBG-1.4 and Robust Video Matt
 The initial supported platform is native OBS on **Linux x86-64**, with SDR sources.
 This is a personal prototype; model licensing is described below.
 
+## Platform support and setup on another computer
+
+**The current build and installation scripts support native Linux x86-64 only.**
+OBS and ONNX Runtime also run on other operating systems, but this repository does
+not yet produce a Windows or macOS plugin package.
+
+| Target system | Current status | Setup path |
+| --- | --- | --- |
+| Native Linux x86-64, NVIDIA GPU | Implemented; validated on Linux Mint 22 | Follow [Linux prerequisites](#build-linux), the CUDA build, and [user installation](#install-for-your-user). |
+| Native Linux x86-64, CPU or AMD/Intel graphics | CPU inference implemented | Follow the CPU build and select **CPU** with an FP32 model. AMD/Intel GPU inference is not implemented. Measure throughput before using it live. |
+| Other Linux distributions on x86-64 | Requires compatible dependencies; not individually validated | Build locally against OBS 30+ development files from the same source as your OBS installation. Package names vary by distribution. |
+| Flatpak OBS | No Flatpak package supplied | Use native OBS for the documented installation. A Flatpak extension/build is separate work; copying the native plugin into the sandbox is not a supported installation. |
+| Linux ARM64, including Raspberry Pi/Jetson | Not packaged or validated | The download scripts fetch x86-64 libraries. An ARM64 runtime, build, and target-device validation are required. |
+| macOS, Apple silicon or Intel | Not implemented or validated | See [macOS port requirements](#macos-port-requirements). |
+| Windows | Not implemented or validated | See [Windows port requirements](#windows-port-requirements). WSL-built Linux libraries cannot be loaded by Windows OBS. |
+
+On a new Linux computer, clone the source and run the setup there. Models, SDKs, and
+private CUDA libraries are ignored by Git and must be downloaded separately. The
+`.onnx` model files can be reused after checksum verification; compiled plugin/runtime
+libraries must match the target OS, architecture, and OBS installation. Do not copy an
+old CMake build directory, which contains paths from the original computer.
+
+- [Build on Linux](#build-linux) and [install for your user](#install-for-your-user)
+- [Download and verify models](#model-download)
+- [Repair failed model downloads](#repair-failed-model-downloads)
+- [Troubleshoot loading and runtime errors](#troubleshooting)
+
 ## Try it in OBS
 
 1. Build and install using the commands below, then restart OBS.
 2. Right-click your webcam source → **Filters**.
 3. Under **Effect Filters**, click **+** → **Background Removal (RMBG / RVM)**.
-4. The model is selected automatically when installed with `RMBG_INSTALL_MODEL=ON`.
-   Otherwise select `data/models/rmbg-1.4.onnx` from this checkout.
+4. RMBG is selected automatically when installed with `RMBG_INSTALL_MODEL=ON`.
+   For RVM, select `rvm_mobilenetv3_fp32.onnx` in the installed `data/models/`
+   directory or this checkout. Download locations are listed [below](#model-download).
 5. Leave **Inference device** on **Automatic**, or choose **CUDA GPU** to require it.
-6. Click **Refresh status / retry model** after loading. Confirm **Ready: CUDA**.
+   On a CPU-only installation, select **CPU** and start with an FP32 model.
+6. Click **Refresh status / retry model** after loading. Confirm **Ready: CUDA** or
+   **Ready: CPU**, matching your intended device.
 7. Add a Color Source or image **below** your webcam to clearly see the transparency.
 
 For a human webcam on the development machine, select **RVM MobileNetV3 FP32**, choose
@@ -330,28 +360,67 @@ picker replacement for RVM. [Official MatAnyone 2 project](https://github.com/pq
 ## Build (Linux)
 
 Required: CMake 3.24+, a C++17 compiler, OBS 30+ development files, libpng development
-files, and Python 3.11+ with tarfile's safe `data` extraction filter (Python 3.12 on Mint 22).
-Common Ubuntu packages: `build-essential cmake libobs-dev libpng-dev libsimde-dev`.
+files, and Python with `hashlib.file_digest` and tarfile's safe `data` extraction filter.
+**Python 3.12+ is recommended** (3.12 was used on Mint 22); older Python 3.11 patch
+releases may lack the extraction filter. See [Python's extraction-filter documentation](https://docs.python.org/3.12/library/tarfile.html#extraction-filters).
 The installed OBS application and development libraries should come from the same source.
 
-CPU-only build:
+### Prerequisites on a fresh Linux machine
+
+For Ubuntu/Mint with repositories providing OBS 30+ and the required tool versions:
+
+```sh
+sudo apt update
+sudo apt install git build-essential cmake python3 obs-studio libobs-dev libpng-dev libsimde-dev
+git clone https://github.com/RajKKapadia/obs-bg-removal-plugin.git
+cd obs-bg-removal-plugin
+uname -m
+obs --version
+cmake --version
+python3 --version
+```
+
+`uname -m` must report `x86_64` for the supplied SDK downloads. On another distribution,
+install equivalent compiler, CMake, Python, OBS development, libpng, and SIMDe packages
+through its package manager. If the OBS application came from a different repository,
+obtain matching development files there too. A Flatpak installation does not supply the
+native `libobs` development package used by these commands.
+
+Run all following shell commands from the repository root. Choose **one** backend below.
+Both examples download RMBG and the two MobileNetV3 models, and include them in a personal
+installation. For RVM alone, add `--skip-model` to the bootstrap command and change
+`-DRMBG_INSTALL_MODEL=ON` to `-DRMBG_INSTALL_MODEL=OFF`.
+
+### CPU-only build
 
 ```sh
 python3 scripts/bootstrap.py --backend cpu
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+python3 scripts/download-rvm.py
+cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DONNXRUNTIME_ROOT="$PWD/.deps/onnxruntime-linux-x64-1.29.0" \
+  -DRMBG_CUDA_LIBRARY_DIR= \
+  -DRMBG_INSTALL_MODEL=ON -DRVM_INSTALL_MODELS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
-CUDA build used on the development machine:
+`--fresh` clears cached SDK/library paths when switching between CPU and CUDA builds;
+include any additional configure options again. Start with RVM MobileNetV3 **FP32**, an input
+limit of 640 or 1280, and a modest update rate; CPU performance depends on the machine.
+
+### NVIDIA CUDA build
+
+Confirm `nvidia-smi` works before starting. The following is the build used on the
+development machine:
 
 ```sh
 python3 scripts/bootstrap.py --backend cuda --simde
 python3 scripts/prepare-cuda.py
-cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+python3 scripts/download-rvm.py
+cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DONNXRUNTIME_ROOT="$PWD/.deps/onnxruntime-linux-x64-gpu_cuda12-1.29.0" \
   -DRMBG_CUDA_LIBRARY_DIR="$PWD/.deps/cuda/lib" \
-  -DRMBG_INSTALL_MODEL=ON
+  -DRMBG_INSTALL_MODEL=ON -DRVM_INSTALL_MODELS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
@@ -380,6 +449,27 @@ The installed library uses paths relative to itself, including the matching priv
 libraries when configured. Restart OBS after installing or rebuilding.
 This package has **not** been prepared for Flatpak OBS, Windows, or macOS.
 
+Expected layout inside the native Linux plugin directory:
+
+```text
+obs-rmbg/
+  bin/64bit/
+    obs-rmbg.so
+    libonnxruntime.so*                 (including installed versioned links/files)
+    libonnxruntime_providers*.so       (when supplied by the selected SDK)
+    cuda/                             (when private CUDA libraries are configured)
+  data/
+    rmbg.effect
+    locale/en-US.ini
+    licenses/
+    models/                           (only models enabled at configure time)
+```
+
+After installation, restart OBS and follow [Try it in OBS](#try-it-in-obs). Existing
+filters keep their saved model paths: if the path points into your old computer's home
+directory or a moved checkout, select the file on the new computer explicitly.
+Downloaded checkout models and installed models are separate copies.
+
 For an inspectable package before installation:
 
 ```sh
@@ -390,7 +480,85 @@ Model installation defaults **off**. `RMBG_INSTALL_MODEL=ON` is intended for you
 installation, not a public distribution package. Library license notices are installed
 under the plugin's `data/licenses/` directory. Keep BRIA's model terms separate.
 
+For another Linux machine, building there is preferred. If transferring a personal
+staged package to a compatible machine, keep the entire `dist/obs-rmbg/` directory
+together, including runtime libraries, data, and notices. Preserve symlinks when copying.
+Rebuild on the destination if the loader reports incompatible GLIBC/GLIBCXX or OBS
+symbols. After moving between CUDA and CPU builds, stage into a fresh directory to avoid
+retaining old runtime files from an earlier install.
+
+### macOS port requirements
+
+There is currently **no working macOS installation command for this checkout**.
+Installing CMake or renaming `obs-rmbg.so` does not make the Linux package load on macOS.
+A port needs:
+
+- An OBS development SDK, ONNX Runtime SDK, and libpng matching the architecture of
+  the running OBS application (`arm64` or `x86_64`), plus Xcode command-line tools.
+- Platform-aware CMake rules for an OBS `.plugin` bundle, `.dylib` dependencies, and
+  macOS library lookup paths instead of Linux `.so` packaging and `$ORIGIN`.
+- A CPU inference baseline and native rendering/model-load tests. The plugin currently
+  selects only CPU or CUDA; Apple GPU/CoreML acceleration would require additional code.
+
+A completed macOS port would install its bundle under
+`~/Library/Application Support/obs-studio/plugins/`. This is an OBS convention, not a
+package generated by this repository. See the [OBS plugins guide](https://obsproject.com/kb/plugins-guide)
+and [official plugin template](https://github.com/obsproject/obs-plugintemplate) for
+bundle, build, and signing guidance.
+
+### Windows port requirements
+
+There is currently **no working Windows installation command for this checkout**.
+A port needs:
+
+- Visual Studio C++ build tools and matching OBS, ONNX Runtime, and libpng development
+  files for the architecture of the running OBS application.
+- CMake changes for MSVC options, the ONNX Runtime import library and DLLs, and Windows
+  plugin installation. The current scripts download Linux archives and NVIDIA `.so`
+  libraries; running them in PowerShell or WSL does not produce a Windows plugin.
+- CPU model-load and native OBS rendering tests first, followed by CUDA testing with
+  matching Windows runtime DLLs and an NVIDIA driver. DirectML acceleration is not
+  implemented by this plugin.
+
+A completed Windows port would normally install `obs-rmbg.dll` in
+`C:\ProgramData\obs-studio\plugins\obs-rmbg\bin\64bit\`, with effects, locale,
+licenses, and models under the sibling `data\` directory. The Linux `.so` cannot be
+used there. See the [OBS plugins guide](https://obsproject.com/kb/plugins-guide) and
+[official plugin template](https://github.com/obsproject/obs-plugintemplate) for the
+Windows build and package conventions.
+
 ## Model download
+
+### Download locations and installation options
+
+Downloads require an internet connection; inference in OBS does not. Use a writable
+checkout and allow space for the model files plus a temporary download. SDK/CUDA setup
+also needs several GB. The scripts verify SHA256 before accepting a download.
+
+| Model | Download command on Linux | Include in a personal install |
+| --- | --- | --- |
+| RMBG-1.4 FP32 | `python3 scripts/bootstrap.py --backend cpu` (or `--backend cuda`) | `-DRMBG_INSTALL_MODEL=ON` |
+| RVM MobileNetV3 FP32 and FP16 | `python3 scripts/download-rvm.py` | `-DRVM_INSTALL_MODELS=ON` |
+| RVM ResNet50 FP32 and FP16 | `python3 scripts/download-rvm.py --variant resnet50` | `-DRVM_INSTALL_RESNET_MODELS=ON` |
+
+All models go into `data/models/` in the checkout. CMake options only **copy** already
+downloaded models; they do not download them. Each RVM install option requires **both**
+FP32 and FP16 files for that variant. If you download only `--precision fp32`, leave
+the corresponding install option off and select that file directly in OBS, or download
+both before installing. RVM installation does not change the default model picker to RVM.
+
+For model-file preparation on macOS, the RVM script can be run with Python 3.12+ using
+the same `python3` command. In Windows PowerShell with the Python launcher, use:
+
+```powershell
+py -3.12 scripts/download-rvm.py --variant mobilenetv3 --precision both
+```
+
+This only downloads portable model files; macOS/Windows plugin support still requires
+the ports described above. `bootstrap.py` and `prepare-cuda.py` stage Linux dependencies
+and are not macOS/Windows setup tools.
+
+### RMBG provenance
 
 The bootstrap script downloads the original FP32 ONNX file from the official repository:
 
@@ -399,8 +567,9 @@ The bootstrap script downloads the original FP32 ONNX file from the official rep
 - Revision: `2ceba5a5efaec153162aedea169f76caf9b46cf8`
 - SHA256: `8cafcf770b06757c4eaced21b1a88e57fd2b66de01b8045f35f01535ba742e0f`
 
-If access is required, download **model.onnx** in your browser and save it at that
-destination. The plugin accepts FP32 or FP16 input/output tensors for the supported
+If access is required, download the [pinned **model.onnx**](https://huggingface.co/briaai/RMBG-1.4/resolve/2ceba5a5efaec153162aedea169f76caf9b46cf8/onnx/model.onnx?download=true)
+in your browser and save it at that destination. Verify its SHA256 using the commands
+below. The plugin accepts FP32 or FP16 input/output tensors for the supported
 model signatures. Internal model precision can differ from these types: the official
 RMBG **model_fp16.onnx** preserves FP32 inputs and outputs. No Python model code or
 Hugging Face token is used inside OBS.
@@ -434,6 +603,95 @@ BRIA's current [model card](https://huggingface.co/briaai/RMBG-1.4) advertises n
 use. Its linked agreement was unavailable during development; an older agreement limits
 use to evaluation. Follow the terms attached to your model access. The code's license
 does not grant any additional rights to model weights.
+
+### Verify a downloaded model
+
+Use the hash for the **exact variant** you downloaded. RVM files are available as
+assets in the [official v1.0.0 release](https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0).
+These pins also appear in [the download script](scripts/download-rvm.py) and
+[RVM provenance notice](data/licenses/rvm/NOTICE.txt).
+
+| RVM filename | SHA256 |
+| --- | --- |
+| `rvm_mobilenetv3_fp32.onnx` | `88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828` |
+| `rvm_mobilenetv3_fp16.onnx` | `6a0d5ce6cc17702613be548559879b4521ed424cfe14ddc48d1acaa44d616f64` |
+| `rvm_resnet50_fp32.onnx` | `25db300fcb6ee27f941a1b52c97856e8d1f13c7f35817f81a612f89af0e8a85c` |
+| `rvm_resnet50_fp16.onnx` | `a9266f5046411d604bbff38e18c54bf8c70d85d93bbc400564697590f5712738` |
+
+Linux (replace the filename to check another model):
+
+```sh
+sha256sum data/models/rvm_mobilenetv3_fp32.onnx
+```
+
+macOS:
+
+```sh
+shasum -a 256 data/models/rvm_mobilenetv3_fp32.onnx
+```
+
+Windows PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\data\models\rvm_mobilenetv3_fp32.onnx
+```
+
+The complete hash must match the corresponding value above, ignoring letter case.
+Check the **actual file selected in OBS**, including the installed copy if applicable.
+A matching checkout file does not prove an older installed copy is intact. A filename
+or nonzero size alone is not verification. A tiny file containing HTML, a login message,
+or `version https://git-lfs.github.com/spec/v1` is a page/pointer, not the model weights.
+
+### Repair failed model downloads
+
+1. **Capture the failure.** Note the exact command, model filename, and error. Check
+   connectivity, free disk space, and write access to the checkout. Do not run downloads
+   with `sudo`; use a directory owned by your user.
+2. **Rerun the same downloader.** Valid existing files print `Verified existing` and
+   are reused. Missing files or files with a wrong hash are downloaded again. Downloads
+   use a `.part` file and replace the destination only after verification. Interrupted
+   transfers restart from the beginning; there is no resume option. Normal failures
+   clean up `.part`; a leftover after a killed process can be removed once no downloader
+   is running. There is no need to delete all models or edit the checksum pins.
+3. **Verify the resulting file** with the commands above. If downloading in a browser,
+   use the pinned RMBG link or the RVM v1.0.0 release asset, not a repository HTML page,
+   source-code archive, TensorFlow.js file, or PyTorch checkpoint. Save it with the exact
+   `.onnx` filename. For offline setup, transfer a verified copy and hash it again on
+   the destination; the native SDK/runtime dependencies must also be present to build.
+4. **Update the file OBS actually uses.** Select the repaired checkout file explicitly,
+   or close OBS and rerun the configured `cmake --install build --prefix
+   "${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins"` to update installed copies.
+   Reinstalling a model requires its corresponding CMake install option to be enabled.
+5. **Reload and check status.** Reopen OBS if you reinstalled. Select the intended model,
+   click **Refresh status / retry model** on an error, wait for loading, and refresh
+   again. If a ready session still holds an older file replaced at the same path,
+   restart OBS to force it to reopen the file. Expect **Ready: CPU** or **Ready: CUDA**.
+
+Examples from the repository root (run only the command for the file being repaired):
+
+```sh
+python3 scripts/download-rvm.py --variant mobilenetv3 --precision fp32
+python3 scripts/download-rvm.py --variant resnet50 --precision both
+python3 scripts/bootstrap.py --backend cpu
+```
+
+For a CUDA installation, use `--backend cuda` in the last command. Bootstrap verifies
+and extracts the selected Linux SDK before downloading RMBG; it does not rebuild or
+change the installed plugin. Use the pinned browser link if you only need the RMBG file.
+
+| Symptom | Likely cause and recovery |
+| --- | --- |
+| Timeout, connection reset, DNS failure, or HTTP 429/5xx | Retry later or use a stable connection. For proxy networks, configure the required `HTTPS_PROXY`/`HTTP_PROXY` settings before running Python. |
+| `CERTIFICATE_VERIFY_FAILED` | Check the system clock and Python/OS trust store; install the network's required CA certificate through its supported setup. Keep TLS verification enabled. |
+| HTTP 401/403 for RMBG | Open the pinned link in a browser and complete any required access steps. The script does not accept a Hugging Face token argument. If access remains unavailable, use RVM with bootstrap `--skip-model` and `RMBG_INSTALL_MODEL=OFF`. |
+| `SHA256 mismatch ... refusing to use it` | The bytes differ from the pinned asset, possibly due to truncation, an error page, a proxy, or a changed upstream asset. Retry the official download and compare its hash; keep the pin unchanged until the asset's provenance is checked. |
+| `No space left on device` / `Permission denied` | Free space or use a writable checkout, then rerun. `.deps/`, temporary downloads, and optional installed copies also consume space. |
+| `hashlib` has no `file_digest`, or tar extraction rejects `filter` | Use Python 3.12+ and rerun. Do not remove the extraction filter to work around an old interpreter. |
+| CMake install cannot find an `.onnx` file | An install option is enabled but its files were not downloaded. Download the required model(s), including both precisions for an enabled RVM variant, or disable that option and choose your file manually. |
+| `Choose an existing RMBG-1.4 or RVM ONNX model file` | The selected path is empty, missing, or still points to another machine. Pick an existing local file, then retry. |
+| ONNX/protobuf parse error or `INVALID_PROTOBUF` | Verify the selected file's hash first. An incomplete file, HTML download, or Git LFS pointer can cause this. Re-download the exact official ONNX asset. |
+| `Unsupported model signature` or RVM tensor/dimension errors | Select a supported RMBG-1.4 or official RVM ONNX export. Renaming another model to one of these filenames does not convert it. |
+| CUDA/provider/library error with a matching model hash | Check the runtime installation in [Troubleshooting](#troubleshooting). Re-downloading valid weights will not repair missing CUDA libraries. Try an FP32 model with **CPU** to isolate the backend. |
 
 ## Test an image without OBS
 
@@ -703,6 +961,41 @@ On Linux Mint 22.3, OBS 32.2.0, Intel Core Ultra 7 265K and NVIDIA RTX 5070 Ti:
 
 ## Troubleshooting
 
+For incomplete downloads, checksum failures, missing models, and ONNX parse errors,
+start with [Repair failed model downloads](#repair-failed-model-downloads).
+
+### Build or plugin loading failures
+
+| Error or symptom | What to check |
+| --- | --- |
+| CMake cannot find `libobs` / `libobsConfig.cmake` | Install matching OBS 30+ development files. For a custom SDK, pass `-Dlibobs_DIR=/absolute/path/to/directory/containing/libobsConfig.cmake`. The OBS executable alone is not a development SDK. |
+| CMake cannot find `onnxruntime_cxx_api.h` or `ORT_LIBRARY` | Bootstrap must finish successfully; point `ONNXRUNTIME_ROOT` at the extracted SDK containing `include/` and `lib/`, not its `.tgz` archive or a Python package. Use the CPU or CUDA path from the build examples. |
+| Missing `png.h`, `PNG_LIBRARY`, or `simde/...` headers | Install the libpng/SIMDe development packages. On Ubuntu/Mint, bootstrap's optional `--simde` can extract the pinned SIMDe package locally. |
+| `wrong ELF class`, architecture error, `GLIBC_*`/`GLIBCXX_* not found`, or undefined OBS symbols | Check architecture and dependency compatibility. Rebuild on the target Linux machine against its matching OBS SDK; do not use a Linux binary in Windows/macOS or an x86-64 SDK on ARM64. |
+| Missing `libonnxruntime.so`, CUDA library, effect, or locale | Reinstall the complete plugin directory with the matching libraries and `data/`, then restart OBS. Copying just `obs-rmbg.so` is insufficient. |
+| A CPU setting does not help because the module fails to load | The private CUDA build links NVIDIA libraries directly. Restore those libraries or rebuild/install the CPU-only configuration; model initialization fallback cannot fix an unloaded plugin. |
+
+On native Linux, inspect dependencies of your own installed module:
+
+```sh
+ldd "${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins/obs-rmbg/bin/64bit/obs-rmbg.so"
+```
+
+Resolve any `not found` entries. For a CUDA build, also inspect the provider's dependencies:
+
+```sh
+ldd "${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins/obs-rmbg/bin/64bit/libonnxruntime_providers_cuda.so"
+nvidia-smi
+```
+
+The second library exists only in the CUDA SDK. These checks diagnose library/driver
+availability; they do not validate model inference. Use [the image CLI](#test-an-image-without-obs)
+with a real local PNG and the verified model, first with `--device cpu` and FP32, then
+with `--device cuda` if configured. If the CLI works but OBS fails, compare the model
+path and libraries in the installed package with those used by the build.
+
+### OBS status and performance
+
 - **Filter missing:** restart OBS, check the native/Flatpak installation distinction,
   and inspect Help → Log Files → View Current Log for `obs-rmbg`.
 - **Ready: CPU:** automatic CUDA initialization fell back. Rebuild with the CUDA SDK and
@@ -723,3 +1016,11 @@ On Linux Mint 22.3, OBS 32.2.0, Intel Core Ultra 7 265K and NVIDIA RTX 5070 Ti:
 - **Whole video stutters:** check OBS's Stats window for rendering/encoding lag and GPU
   contention. Reducing mask updates to **15** can free GPU time, at the cost of slower
   cutout updates. CPU mode is a functionality fallback for this model.
+
+When reporting an unresolved issue, include the OS/distribution and architecture, OBS
+version and installation type (native/Flatpak/portable), plugin version or Git commit,
+chosen CPU/CUDA build, GPU/driver if applicable, model filename and SHA256, and exact
+error. For setup failures, include the failing command and Python/CMake versions.
+In OBS, copy the filter's **Status** after refreshing and relevant entries from
+**Help → Log Files → View Current Log** (look for `obs-rmbg`, ONNX Runtime, or CUDA).
+Check copied paths/logs for personal information before sharing them.
