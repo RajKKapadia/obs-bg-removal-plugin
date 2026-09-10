@@ -3,7 +3,25 @@
 A native C++ OBS **Effect Filter** that runs BRIA RMBG-1.4 and Robust Video Matting
 (RVM MobileNetV3 / ResNet50) locally with ONNX Runtime.
 The initial supported platform is native OBS on **Linux x86-64**, with SDR sources.
-This is a personal prototype; model licensing is described below.
+This is an experimental community plugin. Performance and supported platforms are
+documented below; model licenses are separate from the plugin's source license.
+
+## License and model choice
+
+The plugin source is licensed under **GPL-2.0-or-later**; see [LICENSE](LICENSE) and
+[COPYING](COPYING). Model weights and third-party runtime libraries have their own terms.
+This source repository does not include downloaded models or runtime binaries.
+
+The setup examples below use **RVM MobileNetV3** and leave BRIA RMBG-1.4 optional.
+RVM's upstream GPL-3.0 license and provenance are retained in
+[data/licenses/rvm/](data/licenses/rvm/NOTICE.txt).
+BRIA's [RMBG-1.4 model card](https://huggingface.co/briaai/RMBG-1.4) describes
+noncommercial use and requires a separate agreement for commercial use. Check the
+terms attached to your access before downloading or using those weights. This project's
+GPL license does not extend to them or grant permission to redistribute them.
+
+For contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). Maintainers preparing source
+archives or binaries should read [the public release guide](docs/PUBLIC_RELEASE.md).
 
 ## Platform support and setup on another computer
 
@@ -37,9 +55,10 @@ old CMake build directory, which contains paths from the original computer.
 1. Build and install using the commands below, then restart OBS.
 2. Right-click your webcam source → **Filters**.
 3. Under **Effect Filters**, click **+** → **Background Removal (RMBG / RVM)**.
-4. RMBG is selected automatically when installed with `RMBG_INSTALL_MODEL=ON`.
-   For RVM, select `rvm_mobilenetv3_fp32.onnx` in the installed `data/models/`
-   directory or this checkout. Download locations are listed [below](#model-download).
+4. Select `rvm_mobilenetv3_fp32.onnx` in the installed `data/models/` directory or
+   this checkout. RVM must be selected explicitly; installing its files does not change
+   the model picker default. If you separately install RMBG with `RMBG_INSTALL_MODEL=ON`,
+   new filters can select it automatically. Download locations are listed [below](#model-download).
 5. Leave **Inference device** on **Automatic**, or choose **CUDA GPU** to require it.
    On a CPU-only installation, select **CPU** and start with an FP32 model.
 6. Click **Refresh status / retry model** after loading. Confirm **Ready: CUDA** or
@@ -387,19 +406,20 @@ obtain matching development files there too. A Flatpak installation does not sup
 native `libobs` development package used by these commands.
 
 Run all following shell commands from the repository root. Choose **one** backend below.
-Both examples download RMBG and the two MobileNetV3 models, and include them in a personal
-installation. For RVM alone, add `--skip-model` to the bootstrap command and change
-`-DRMBG_INSTALL_MODEL=ON` to `-DRMBG_INSTALL_MODEL=OFF`.
+Both examples download the runtime and the two RVM MobileNetV3 models, and include the
+RVM files in a personal installation. `--skip-model` skips BRIA's RMBG download;
+`RMBG_INSTALL_MODEL=OFF` excludes it from the install. Existing RMBG functionality and
+download support remain available through [the optional setup](#optional-rmbg-14-setup).
 
 ### CPU-only build
 
 ```sh
-python3 scripts/bootstrap.py --backend cpu
+python3 scripts/bootstrap.py --backend cpu --skip-model
 python3 scripts/download-rvm.py
 cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DONNXRUNTIME_ROOT="$PWD/.deps/onnxruntime-linux-x64-1.29.0" \
   -DRMBG_CUDA_LIBRARY_DIR= \
-  -DRMBG_INSTALL_MODEL=ON -DRVM_INSTALL_MODELS=ON
+  -DRMBG_INSTALL_MODEL=OFF -DRVM_INSTALL_MODELS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
@@ -414,13 +434,13 @@ Confirm `nvidia-smi` works before starting. The following is the build used on t
 development machine:
 
 ```sh
-python3 scripts/bootstrap.py --backend cuda --simde
+python3 scripts/bootstrap.py --backend cuda --skip-model --simde
 python3 scripts/prepare-cuda.py
 python3 scripts/download-rvm.py
 cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DONNXRUNTIME_ROOT="$PWD/.deps/onnxruntime-linux-x64-gpu_cuda12-1.29.0" \
   -DRMBG_CUDA_LIBRARY_DIR="$PWD/.deps/cuda/lib" \
-  -DRMBG_INSTALL_MODEL=ON -DRVM_INSTALL_MODELS=ON
+  -DRMBG_INSTALL_MODEL=OFF -DRVM_INSTALL_MODELS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
@@ -435,6 +455,22 @@ The NVIDIA driver still needs to work (`nvidia-smi`). No global CUDA installatio
 ONNX Runtime is pinned to **1.29.0**. CUDA dependencies are pinned to runtime **12.9.79**,
 cuBLAS **12.9.1.4**, and cuDNN **9.10.2.21**. Downloaded libraries and models are ignored
 by Git. The GPU SDK plus private libraries use several GB of disk space.
+
+### Optional RMBG-1.4 setup
+
+After reviewing BRIA's model terms, download the pinned RMBG file using the existing
+bootstrap command without `--skip-model`. Match the backend to the build you configured:
+
+```sh
+# CPU build; use --backend cuda instead for a CUDA build.
+python3 scripts/bootstrap.py --backend cpu
+cmake -S . -B build -DRMBG_INSTALL_MODEL=ON
+```
+
+Then use the installation command below. This adds RMBG to a personal install and
+keeps the existing RVM configuration. To use a file directly from the checkout, leave
+the install option off and select it in OBS. The bootstrap script's original behavior
+is unchanged: omitting `--skip-model` downloads RMBG as well as the selected SDK.
 
 ## Install for your user
 
@@ -475,6 +511,10 @@ For an inspectable package before installation:
 ```sh
 cmake --install build --prefix "$PWD/dist"
 ```
+
+This stages a **personal installation**, including any enabled models and private
+runtime dependencies. It is not a reviewed public release package. Keep it local;
+follow [the release guide](docs/PUBLIC_RELEASE.md) before publishing downloadable assets.
 
 Model installation defaults **off**. `RMBG_INSTALL_MODEL=ON` is intended for your personal
 installation, not a public distribution package. Library license notices are installed

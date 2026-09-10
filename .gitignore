@@ -5,6 +5,9 @@
 /dist/
 /artifacts/
 
+# Private history backups created while preparing a public source release
+*.bundle
+
 # Model weights stay local; bootstrap.py downloads the pinned model
 *.onnx
 *.onnx.data
