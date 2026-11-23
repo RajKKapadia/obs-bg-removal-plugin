@@ -1,7 +1,9 @@
-# OBS background removal: RMBG-1.4 and RVM
+# OBS background removal: RMBG-1.4, RVM and experimental V-RMBG 3.0
 
 A native C++ OBS **Effect Filter** that runs BRIA RMBG-1.4 and Robust Video Matting
-(RVM MobileNetV3 / ResNet50) locally with ONNX Runtime.
+(RVM MobileNetV3 / ResNet50) locally with ONNX Runtime. An experimental adapter and
+export workflow for **BRIA V-RMBG 3.0** are available; real-model conversion and performance
+remain pending approved access to BRIA's gated files. See [V-RMBG setup and validation](docs/VRMBG3.md).
 The initial supported platform is native OBS on **Linux x86-64**, with SDR sources.
 This is an experimental community plugin. Performance and supported platforms are
 documented below; model licenses are separate from the plugin's source license.
@@ -19,6 +21,9 @@ BRIA's [RMBG-1.4 model card](https://huggingface.co/briaai/RMBG-1.4) describes
 noncommercial use and requires a separate agreement for commercial use. Check the
 terms attached to your access before downloading or using those weights. This project's
 GPL license does not extend to them or grant permission to redistribute them.
+
+V-RMBG 3.0 requires separate approved access and applicable BRIA terms. Its exports stay
+local and are not installed or downloaded by the normal setup commands.
 
 For contributions, see [CONTRIBUTING.md](CONTRIBUTING.md). Maintainers preparing source
 archives or binaries should read [the public release guide](docs/PUBLIC_RELEASE.md).
@@ -54,7 +59,7 @@ old CMake build directory, which contains paths from the original computer.
 
 1. Build and install using the commands below, then restart OBS.
 2. Right-click your webcam source → **Filters**.
-3. Under **Effect Filters**, click **+** → **Background Removal (RMBG / RVM)**.
+3. Under **Effect Filters**, click **+** → **Background Removal (RMBG / RVM / V-RMBG)**.
 4. Select `rvm_mobilenetv3_fp32.onnx` in the installed `data/models/` directory or
    this checkout. RVM must be selected explicitly; installing its files does not change
    the model picker default. If you separately install RMBG with `RMBG_INSTALL_MODEL=ON`,
@@ -71,8 +76,9 @@ This selects 30 mask updates, matching, immediate readback, 1920 input limit, au
 RVM downsampling, and neutral alpha controls. It leaves the model and device unchanged.
 The model must be loaded as RVM before the button is enabled; refresh status if necessary.
 
-New-filter defaults remain 15 updates, matching off, smoothing 0, threshold 0.5, and
-softness 0.5. Existing filters retain saved values until you edit them or use the preset.
+Filters default to 30 mask updates with matching enabled, smoothing 0, threshold 0.5,
+and softness 0.5. Existing filters use these defaults for unset controls and retain any
+explicitly saved values.
 See [the complete tuning guide](#tuning-guide) for every control and camera setup.
 
 The original source, including its background, stays visible while loading, on errors,
@@ -89,8 +95,8 @@ can still wait for the GPU. If OBS reports increased rendering lag on your scene
 this option to restore deferred readback. **Refresh status** shows readback duration and
 mask age; these are snapshots, not a continuously updating meter.
 
-**Match video to mask** is optional and off by default. Enable it to display each completed
-mask with the exact video frame that produced it. The retained video stays at the source's
+**Match video to mask** is on by default. Each completed mask is displayed with the exact
+video frame that produced it. The retained video stays at the source's
 full resolution on the GPU, even when RVM uses a smaller inference image. Until the next
 result arrives, the last complete video/mask pair repeats. This removes temporal offset
 between video and mask, but delays video and limits visible motion updates to the completed
@@ -138,7 +144,7 @@ limits GPU capture/readback work; the separate downsample ratio controls RVM's c
 processing stage before refinement. Automatic uses an internal long edge of approximately
 480 pixels: for a 1280×720 capture it selects 0.375. Try a smaller ratio for less processing
 or a larger one for different framing, such as full-body shots; larger is not always better.
-The RVM controls have no effect on RMBG's fixed 1024×1024 input.
+The RVM controls have no effect on RMBG or V-RMBG's fixed 1024×1024 input.
 
 The four recurrent states are carried across processed frames and remain on CUDA when
 CUDA is selected. They reset on source/capture dimension changes, model/settings reload,
@@ -172,22 +178,22 @@ detail that the camera already blurred during exposure.
 ### Every parameter
 
 Defaults below are **new-filter defaults**, not the values in the quality preset.
-Controls apply to both model families unless the table identifies an RVM requirement.
+Controls apply to all model families unless the table identifies an RVM requirement.
 The RVM group is named **RVM settings (used only with an RVM model)**. Changes to model,
 device, CPU threads, RVM input size, downsample ratio, or effective foreground-color mode
 reload the model and reset temporal state. Other controls do not reload it.
 
 | Exact UI label | Default / allowed values | Purpose, tuning direction, and interactions |
 | --- | --- | --- |
-| Model file (RMBG-1.4 or RVM ONNX) | Installed `rmbg-1.4.onnx`; existing supported `.onnx` file | RVM targets people and remembers preceding processed frames. RMBG targets salient objects and may retain chairs. Model family is detected from its signature. ResNet50 uses the RVM interface. File name is shown in status; renaming a file does not establish its architecture. |
+| Model file (RMBG-1.4, RVM, or exported V-RMBG 3.0 ONNX) | Installed `rmbg-1.4.onnx`; existing supported `.onnx` file | RVM targets people and remembers preceding processed frames. RMBG targets salient objects and may retain chairs. V-RMBG requires the versioned experimental export. Model family is detected from its signature and, for V-RMBG, metadata. ResNet50 uses the RVM interface. File name is shown in status; renaming a file does not establish its architecture. |
 | Inference device | Automatic (CUDA, then CPU); CPU; CUDA GPU (requires compatible runtime and libraries) | Automatic reports a warning when CUDA initialization falls back to CPU. Explicit CUDA makes initialization failure visible instead of switching to a slower CPU session. `Ready: CUDA` does not imply every graph operation executes on GPU. |
 | CPU threads | 2; 1–32, step 1 | ONNX intra-operation CPU threads, including CPU work in a CUDA session. More can help CPU inference but compete with OBS and decoding. This is not a CUDA thread count. |
-| Maximum mask updates per second | 15; 1–60, step 1 | Capture/inference-request ceiling. Actual throughput depends on processing and OBS cadence. Increase to 30 for this 30 FPS camera. Setting 60 does not create 60 unique camera frames. |
+| Maximum mask updates per second | 30; 1–60, step 1 | Capture/inference-request ceiling. Actual throughput depends on processing and OBS cadence. Reduce it if OBS rendering lags. Setting 60 does not create 60 unique frames from a 30 FPS camera. |
 | Low latency readback (disable if rendering stalls) | On; On/Off | Maps the captured GPU image in the same video tick. Disable only when measured OBS rendering stalls improve with deferred mapping; deferral adds one OBS tick before submission. |
-| Match video to mask (buffers video; disables extra smoothing) | Off; On/Off | Displays the full-resolution capture that produced each matte. Repeats the last pair until another completes. Removes video/mask temporal offset, adds video delay, and does not delay audio. |
+| Match video to mask (buffers video; disables extra smoothing) | On; On/Off | Displays the full-resolution capture that produced each matte. Repeats the last pair until another completes. Removes video/mask temporal offset, adds video delay, and does not delay audio. |
 | Temporal smoothing (live video mode only) | 0; 0–0.95, step 0.05 | Blends preceding and current alpha in live mode. Larger values reduce flicker but can trail movement. At a 30 Hz update cadence, 0.1 retains 10% of the preceding matte; weights adjust with elapsed capture time. Bypassed in matched mode. RVM's internal recurrence still runs. |
 | Mask threshold | 0.5; 0–1, step 0.01 | Increase to remove more uncertain foreground; decrease to retain more. High values can erase hair and fingers. This remaps alpha; it does not improve model understanding or latency. |
-| Edge softness | 0.5; 0.001–0.5, step 0.01 | Width of alpha transition around threshold, not a spatial blur radius. Lower values harden edges. RVM at threshold/softness 0.5/0.5 preserves predicted alpha; RMBG uses a smoothstep remap. |
+| Edge softness | 0.5; 0.001–0.5, step 0.01 | Width of alpha transition around threshold, not a spatial blur radius. Lower values harden edges. RVM and V-RMBG at threshold/softness 0.5/0.5 preserve predicted alpha; RMBG uses a smoothstep remap. |
 | Maximum input long edge (pixels) | 1280; UI choices 640, 1280, 1920 | RVM only. Preserve aspect ratio without upscaling. Higher values retain refinement detail but increase readback, preprocessing, inference, and optional foreground transfer cost. API/CLI additionally accept integer limits 320–1920. Does not reduce retained matching-video resolution. |
 | Downsample ratio | Automatic (480-pixel internal long edge); 0.125, 0.25, 0.375, 0.5, 0.6, 0.75, 1.0 | RVM only. Controls the coarse stage before high-resolution refinement. Automatic is `min(1,480/input_long_edge)`. Higher ratios cost more and can help smaller/full-body subjects, but are not always better. CLI/API accept 0 (auto) or 0.1–1. |
 | RVM foreground colors (experimental; matched video only) | Off; On/Off | Requests RVM's estimated foreground RGB to reduce possible original-background color contamination. Requires a ready RVM model and matching; refresh after model load. Turning matching off suspends it while retaining the saved checkbox. May alter skin, clothing, or opaque detail and transfers an extra RGB image. Compare before adopting. |
@@ -771,19 +777,18 @@ reports mean/max readback time, matched frames, cache size, and cache misses. Re
 covers mapping, the CPU copy, and submission; source rendering/staging time is included
 in mask age, not the readback timer.
 
-Set `RMBG_TEST_MATCH_VIDEO=1` to test matched video, or `RMBG_TEST_READBACK=deferred` to
-compare the compatibility path. For example, prefix the `xvfb-run` command with either
-or both environment assignments.
+Omit matching settings to test the default. Set `RMBG_TEST_LIVE_VIDEO=1` to test an
+explicit live-mode choice, or `RMBG_TEST_READBACK=deferred` to test deferred readback.
 
 A deterministic motion test uses a tiny generated ONNX graph whose mask is the red input
 channel. This separates frame-pairing correctness from a trained model's accuracy:
 
 ```sh
 uv run --with onnx python tests/make-motion-model.py artifacts/motion.onnx
-RMBG_TEST_MOTION=1 RMBG_TEST_MATCH_VIDEO=1 RMBG_TEST_TOGGLE=1 \
+RMBG_TEST_MOTION=1 RMBG_TEST_TOGGLE=1 \
   xvfb-run -a build/obs-rmbg-smoke \
   "$PWD/build/obs-rmbg.so" "$PWD/data" "$PWD/artifacts/motion.onnx" \
-  "$PWD/input.png" "$PWD/artifacts/motion-result.png" cpu 15 0.9 3
+  "$PWD/input.png" "$PWD/artifacts/motion-result.png" cpu 30 0.9 3
 ```
 
 The input PNG supplies dimensions (at least 64 pixels per side); the test replaces it
@@ -920,13 +925,15 @@ count the last five seconds; `distinct_pairs`, `repeated_presentations`, `replac
 and the original `completed` count the instance's lifetime. Live mode reports no matched
 pair rate/repeats. This is a synchronous snapshot API; it does not introduce a background
 poller or continuous log stream into OBS.
+`is_vrmbg3` identifies the experimental V-RMBG adapter; `is_rvm` retains its original meaning.
 
 ## Implementation
 
 - `src/model.cpp`: detects model signatures, converts premultiplied RGBA to RGB NCHW
-  (RMBG: `channel / 255 - 0.5`; RVM: `channel / 255`), handles FP32/FP16 tensors, and
+  (RMBG: `channel / 255 - 0.5`; RVM: `channel / 255`; V-RMBG: ImageNet normalization), handles FP32/FP16 tensors, and
   runs ONNX. FP16 preprocessing and RVM alpha conversion avoid FP32 intermediate buffers.
-  RVM recurrent tensors use device I/O binding and its alpha range is preserved.
+  RVM recurrent tensors and V-RMBG masked-RGB feedback use device I/O binding;
+  both models' alpha ranges are preserved.
 - `src/worker.cpp`: loads models off the render thread and processes one in-flight
   frame with one replaceable waiting frame. New captures replace older waiting frames;
   the queue never grows. A bounded buffer pool reuses RGBA storage. Capture identity tokens
@@ -1053,6 +1060,10 @@ path and libraries in the installed package with those used by the build.
   still needs time to process each frame; increasing the limit above its throughput cannot
   remove that delay. Lowering webcam resolution does not shrink RMBG's fixed 1024×1024 input;
   RVM uses the source dimensions subject to its separate input limit.
+- **Microphone, boom arm, or another stationary object fades out:** turn on **Show mask
+  instead of video**. If the object is gray, lower **Mask threshold** in small steps and
+  compare with the preview off. If the object stays black, try RMBG-1.4, whose mask targets
+  salient objects.
 - **Whole video stutters:** check OBS's Stats window for rendering/encoding lag and GPU
   contention. Reducing mask updates to **15** can free GPU time, at the cost of slower
   cutout updates. CPU mode is a functionality fallback for this model.

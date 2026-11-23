@@ -8,7 +8,7 @@
 
 namespace rmbg {
 enum class Device { Auto, CPU, CUDA };
-enum class ModelKind { RMBG, RVM };
+enum class ModelKind { RMBG, RVM, VRMBG3 };
 struct ImageSize { uint32_t width, height; };
 ImageSize capture_size(ModelKind kind, uint32_t source_width, uint32_t source_height, uint32_t max_size = 1280);
 struct ModelConfig {
@@ -71,7 +71,9 @@ public:
 private:
     Ort::Value input_tensor(const Frame &frame);
     Ort::Value run_rvm(const Frame &frame, const Ort::Value &input, Ort::Value &foreground);
+    Ort::Value run_vrmbg3(const Frame &frame, const Ort::Value &input);
     void reset_recurrence();
+    void remember_frame(const Frame &frame);
     Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "obs-rmbg"};
     Ort::Session session_{nullptr};
     Ort::MemoryInfo memory_{Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)};
@@ -85,6 +87,9 @@ private:
     std::array<Ort::Value, 4> recurrent_{Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}, Ort::Value{nullptr}};
     std::array<float, 4> initial_float_{};
     std::array<Ort::Float16_t, 4> initial_half_{};
+    Ort::Value previous_foreground_{nullptr}; // Normalized previous RGB * raw model alpha, never UI/smoothed alpha.
+    std::vector<float> initial_foreground_;
+    std::vector<Ort::Float16_t> initial_foreground_half_;
     Frame previous_frame_; // Only metadata is retained; rgba stays empty.
     uint64_t recurrent_frames_ = 0;
 };

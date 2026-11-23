@@ -15,6 +15,7 @@
 *.pth
 *.pt
 *.ckpt
+/data/models/*.validation.json
 
 # CMake / compiler output, including accidental in-source builds
 CMakeCache.txt

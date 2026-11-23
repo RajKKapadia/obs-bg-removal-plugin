@@ -29,7 +29,7 @@ float4 PSDefault(Vertex v) : TARGET
 {
     float mask = person_mask.Sample(linear_sampler, v.uv).r;
     float coverage = smoothstep(threshold - softness, threshold + softness, mask);
-    // RVM already predicts calibrated alpha. Default controls preserve it exactly.
+    // RVM and V-RMBG predict calibrated alpha. Default controls preserve it exactly.
     if (direct_alpha)
         coverage = saturate((mask - (threshold - softness)) / (2.0 * softness));
     if (preview_mask)

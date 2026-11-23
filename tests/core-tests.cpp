@@ -51,6 +51,10 @@ int main()
         rmbg::prepare_rgb(frame, tensor, rmbg::ModelKind::RVM);
         require(tensor[0] == 1.0f && tensor[2] == 0.0f && std::abs(tensor[1] - 0.5f) < 0.0001,
                 "RVM needs uncentered RGB in 0..1 with premultiplied RGB recovered");
+        rmbg::prepare_rgb(frame, tensor, rmbg::ModelKind::VRMBG3);
+        require(std::abs(tensor[0] - (1.0f - 0.485f) / 0.229f) < 0.0001f &&
+                std::abs(tensor[3] - (0.25f - 0.456f) / 0.224f) < 0.0001f,
+                "V-RMBG uses reference channel normalization after recovering straight RGB");
         // Check fused conversion against the previous FP32-then-FP16 path,
         // including transparent and invalid premultiplied channel values.
         frame.width = 256; frame.height = 256; frame.rgba.resize(256 * 256 * 4);
@@ -58,7 +62,7 @@ int main()
             frame.rgba[i * 4] = uint8_t(i); frame.rgba[i * 4 + 1] = uint8_t(255 - i);
             frame.rgba[i * 4 + 2] = uint8_t(i / 7); frame.rgba[i * 4 + 3] = uint8_t(i / 256);
         }
-        for (const auto kind : {rmbg::ModelKind::RMBG, rmbg::ModelKind::RVM}) {
+        for (const auto kind : {rmbg::ModelKind::RMBG, rmbg::ModelKind::RVM, rmbg::ModelKind::VRMBG3}) {
             rmbg::prepare_rgb(frame, tensor, kind);
             std::vector<Ort::Float16_t> half;
             rmbg::prepare_rgb(frame, half, kind);

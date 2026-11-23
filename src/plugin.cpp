@@ -10,14 +10,14 @@
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-rmbg", "en-US")
-MODULE_EXPORT const char *obs_module_description(void) { return "Local RMBG-1.4 and RVM background removal with ONNX Runtime"; }
+MODULE_EXPORT const char *obs_module_description(void) { return "Local RMBG-1.4, RVM, and experimental V-RMBG 3.0 background removal with ONNX Runtime"; }
 MODULE_EXPORT const char *obs_module_author(void) { return "obs-rmbg contributors"; }
 
 namespace {
 struct Settings {
-    int max_fps = 15, stale_ms = 2000;
+    int max_fps = 30, stale_ms = 2000;
     float threshold = 0.5f, softness = 0.5f;
-    bool preview = false, immediate_readback = true, match_video = false, foreground = false;
+    bool preview = false, immediate_readback = true, match_video = true, foreground = false;
 };
 struct RenderStats {
     uint64_t masked_frames = 0;
@@ -113,6 +113,7 @@ public:
              << " ms; age mean/p95: " << age.mean << '/' << age.p95 << " ms"
              << "; input: " << s.width << 'x' << s.height << "; " << s.precision << "; " << s.backend;
         if (s.kind == rmbg::ModelKind::RVM) text << "; downsample: " << std::setprecision(3) << s.downsample_ratio;
+        if (s.kind == rmbg::ModelKind::VRMBG3) text << "; fixed 1024 input; RVM controls unused";
         text << "; file: " << s.model_file;
         if (settings_.foreground && s.kind == rmbg::ModelKind::RVM) text << "; experimental RVM foreground colors";
         return text.str();
@@ -148,7 +149,7 @@ public:
                 stats_generation_ = state.generation; stats_matched_ = settings.match_video;
                 last_presented_id_ = 0;
             }
-            if (!settings.foreground && foreground_texture_) {
+            if ((!settings.foreground || state.kind != rmbg::ModelKind::RVM) && foreground_texture_) {
                 gs_texture_destroy(foreground_texture_); foreground_texture_ = nullptr;
             }
             readback_frame(state, width, height);
@@ -185,7 +186,7 @@ public:
             uploaded_mask_.reset();
             obs_source_skip_video_filter(source_); return;
         }
-        const bool use_foreground = matching_video && settings.foreground && mask->direct_alpha;
+        const bool use_foreground = matching_video && settings.foreground && state.kind == rmbg::ModelKind::RVM;
         if (use_foreground && mask->foreground_rgba.size() != size_t(mask->width) * mask->height * 4) {
             uploaded_mask_.reset();
             error("Missing or invalid RVM foreground colors; original source visible");
@@ -391,20 +392,21 @@ private:
 
 void defaults(obs_data_t *data)
 {
+    const Settings settings;
     char *path = obs_module_file("models/rmbg-1.4.onnx");
     obs_data_set_default_string(data, "model_path", path ? path : ""); bfree(path);
     obs_data_set_default_string(data, "device", "auto");
     obs_data_set_default_int(data, "threads", 2);
     obs_data_set_default_int(data, "rvm_max_size", 1280);
     obs_data_set_default_double(data, "rvm_downsample", 0);
-    obs_data_set_default_int(data, "max_fps", 15);
+    obs_data_set_default_int(data, "max_fps", settings.max_fps);
     obs_data_set_default_int(data, "stale_ms", 2000);
     obs_data_set_default_double(data, "smoothing", 0.0);
     obs_data_set_default_double(data, "threshold", 0.5);
     obs_data_set_default_double(data, "softness", 0.5);
     obs_data_set_default_bool(data, "preview", false);
     obs_data_set_default_bool(data, "immediate_readback", true);
-    obs_data_set_default_bool(data, "match_video", false);
+    obs_data_set_default_bool(data, "match_video", settings.match_video);
     obs_data_set_default_bool(data, "rvm_foreground", false);
 }
 void status_proc(void *data, calldata_t *params)
@@ -419,6 +421,7 @@ void status_proc(void *data, calldata_t *params)
         calldata_set_int(params, "recurrent_frames", state.recurrent_frames);
         calldata_set_bool(params, "recurrent_on_gpu", state.recurrent_on_gpu);
         calldata_set_bool(params, "is_rvm", state.kind == rmbg::ModelKind::RVM);
+        calldata_set_bool(params, "is_vrmbg3", state.kind == rmbg::ModelKind::VRMBG3);
         calldata_set_int(params, "mask_width", state.width); calldata_set_int(params, "mask_height", state.height);
         const auto render = filter->render_stats();
         calldata_set_int(params, "readbacks", render.readbacks);
@@ -456,7 +459,7 @@ void *create(obs_data_t *data, obs_source_t *source)
         auto filter = std::make_unique<Filter>(source);
         filter->update(data);
         proc_handler_add(obs_source_get_proc_handler(source),
-            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready, out int masked_frames, out float mask_age_ms, out float mask_age_sum_ms, out int recurrent_frames, out bool recurrent_on_gpu, out bool is_rvm, out int mask_width, out int mask_height, out int readbacks, out float readback_sum_ms, out float readback_max_ms, out int matched_frames, out int cached_frames, out int cache_misses, out float video_delay_ms, out float mask_rate, out float pair_rate, out int distinct_pairs, out int repeated_presentations, out int repeated_window, out int replaced_frames, out int replaced_window, out float processing_mean_ms, out float processing_p95_ms, out float queue_mean_ms, out float queue_p95_ms, out float age_mean_ms, out float age_p95_ms, out float downsample_ratio, out string precision, out string backend, out string model_file)", status_proc, filter.get());
+            "void rmbg_status(out string status, out int completed, out float inference_ms, out bool ready, out int masked_frames, out float mask_age_ms, out float mask_age_sum_ms, out int recurrent_frames, out bool recurrent_on_gpu, out bool is_rvm, out bool is_vrmbg3, out int mask_width, out int mask_height, out int readbacks, out float readback_sum_ms, out float readback_max_ms, out int matched_frames, out int cached_frames, out int cache_misses, out float video_delay_ms, out float mask_rate, out float pair_rate, out int distinct_pairs, out int repeated_presentations, out int repeated_window, out int replaced_frames, out int replaced_window, out float processing_mean_ms, out float processing_p95_ms, out float queue_mean_ms, out float queue_p95_ms, out float age_mean_ms, out float age_p95_ms, out float downsample_ratio, out string precision, out string backend, out string model_file)", status_proc, filter.get());
         return filter.release();
     } catch (const std::exception &e) { blog(LOG_ERROR, "[obs-rmbg] Creation failed: %s", e.what()); return nullptr; }
 }

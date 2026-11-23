@@ -160,8 +160,9 @@ int main(int argc, char **argv)
     obs_data_set_int(data, "stale_ms", 10000);
     if (const auto *readback = std::getenv("RMBG_TEST_READBACK"))
         obs_data_set_bool(data, "immediate_readback", std::string(readback) != "deferred");
-    const bool match_video = std::getenv("RMBG_TEST_MATCH_VIDEO") != nullptr || std::getenv("RMBG_TEST_PRESET") != nullptr;
-    obs_data_set_bool(data, "match_video", match_video);
+    const bool match_video = std::getenv("RMBG_TEST_LIVE_VIDEO") == nullptr;
+    if (!match_video || std::getenv("RMBG_TEST_MATCH_VIDEO"))
+        obs_data_set_bool(data, "match_video", match_video);
     obs_data_set_bool(data, "rvm_foreground", std::getenv("RMBG_TEST_FOREGROUND") != nullptr);
     obs_data_set_int(data, "rvm_max_size", env_number("RMBG_TEST_RVM_SIZE", 1280, 320, 1920));
     if (argc >= 10) {
@@ -170,6 +171,14 @@ int main(int argc, char **argv)
     }
     auto *filter = obs_source_create_private("obs_rmbg_filter", "Test removal", data); obs_data_release(data);
     if (!source || !filter) { if (source) obs_source_release(source); if (filter) obs_source_release(filter); obs_shutdown(); return 6; }
+    data = obs_source_get_settings(filter);
+    const bool capture_settings_ok = obs_data_get_bool(data, "match_video") == match_video &&
+        obs_data_get_int(data, "max_fps") == (argc >= 10 ? std::stoi(argv[7]) : 30);
+    obs_data_release(data);
+    if (!capture_settings_ok) {
+        std::cerr << "Unexpected matching mode or capture rate\n";
+        obs_source_release(source); obs_source_release(filter); obs_shutdown(); return 6;
+    }
     obs_source_filter_add(source, filter);
     // A scene scales the input to the output canvas, exercising the normal filter chain.
     auto *scene = obs_scene_create_private("RMBG test scene");
@@ -257,6 +266,10 @@ int main(int argc, char **argv)
                   << "; cached frames=" << calldata_int(&after, "cached_frames")
                   << "; cache misses=" << calldata_int(&after, "cache_misses") << '\n';
         success = masks > 0 && frames > 0 && calldata_bool(&after, "ready");
+        if (std::getenv("RMBG_TEST_VRMBG3"))
+            success = success && calldata_bool(&after, "is_vrmbg3") && !calldata_bool(&after, "is_rvm") &&
+                calldata_int(&after, "mask_width") == 1024 && calldata_int(&after, "mask_height") == 1024 &&
+                calldata_int(&after, "recurrent_frames") > 1;
         if (std::getenv("RMBG_TEST_ACCEPTANCE")) {
             success = success && measure_seconds >= 10 && windows_pass;
             std::cout << "30 FPS / p95 <75 ms acceptance windows: " << (windows_pass ? "passed" : "FAILED") << '\n';

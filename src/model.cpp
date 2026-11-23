@@ -17,7 +17,7 @@ uint64_t monotonic_ns()
 ImageSize capture_size(ModelKind kind, uint32_t width, uint32_t height, uint32_t max_size)
 {
     if (!width || !height) throw std::invalid_argument("Source dimensions must be nonzero");
-    if (kind == ModelKind::RMBG) return {1024, 1024};
+    if (kind == ModelKind::RMBG || kind == ModelKind::VRMBG3) return {1024, 1024};
     const double scale = std::min(1.0, double(std::clamp(max_size, 320u, 1920u)) / std::max(width, height));
     return {std::max(1u, uint32_t(std::lround(width * scale))), std::max(1u, uint32_t(std::lround(height * scale)))};
 }
@@ -41,7 +41,9 @@ template<class T> void prepare_rgb_impl(const Frame &frame, std::vector<T> &tens
         const float alpha = frame.rgba[i * 4 + 3] / 255.0f;
         for (size_t c = 0; c < 3; ++c) {
             const float rgb = alpha > 0 ? std::min(1.0f, frame.rgba[i * 4 + c] / (255.0f * alpha)) : 0;
-            tensor[c * n + i] = T(rgb - (kind == ModelKind::RMBG ? 0.5f : 0.0f));
+            constexpr std::array<float, 3> mean{0.485f, 0.456f, 0.406f}, stddev{0.229f, 0.224f, 0.225f};
+            tensor[c * n + i] = T(kind == ModelKind::VRMBG3 ? (rgb - mean[c]) / stddev[c]
+                                 : rgb - (kind == ModelKind::RMBG ? 0.5f : 0.0f));
         }
     }
 }
@@ -129,7 +131,7 @@ Model::Model(const ModelConfig &config) : config_(config)
 {
     env_.DisableTelemetryEvents();
     if (config.path.empty() || !std::filesystem::is_regular_file(config.path))
-        throw std::runtime_error("Choose an existing RMBG-1.4 or RVM ONNX model file");
+        throw std::runtime_error("Choose an existing RMBG-1.4, RVM, or exported V-RMBG 3.0 ONNX model file");
     if (config.rvm_max_size < 320 || config.rvm_max_size > 1920 || !std::isfinite(config.rvm_downsample) ||
         config.rvm_downsample < 0 || config.rvm_downsample > 1 || (config.rvm_downsample > 0 && config.rvm_downsample < 0.1f))
         throw std::invalid_argument("RVM input limit must be 320..1920; downsample ratio must be 0 (auto) or 0.1..1");
@@ -166,7 +168,35 @@ Model::Model(const ModelConfig &config) : config_(config)
         backend_ = "CPU";
     }
     const auto inputs = tensor_specs(session_, true), outputs = tensor_specs(session_, false);
-    if (inputs.size() == 6 && inputs.count("src") && inputs.count("downsample_ratio") && outputs.count("pha")) {
+    Ort::AllocatorWithDefaultOptions allocator;
+    const auto metadata = session_.GetModelMetadata();
+    const auto family = metadata.LookupCustomMetadataMapAllocated("obs_bg_removal.model", allocator);
+    if ((family && std::string(family.get()) == "bria-vrmbg-3.0") || inputs.count("prev_foreground")) {
+        const auto contract = metadata.LookupCustomMetadataMapAllocated("obs_bg_removal.contract", allocator);
+        if (!family || std::string(family.get()) != "bria-vrmbg-3.0" || !contract || std::string(contract.get()) != "1")
+            throw std::runtime_error("V-RMBG 3.0 requires the versioned export from scripts/export-vrmbg3.py");
+        if (inputs.size() != 2 || !inputs.count("src") || !inputs.count("prev_foreground") ||
+            outputs.size() != 2 || !outputs.count("pha") || !outputs.count("next_foreground"))
+            throw std::runtime_error("Invalid V-RMBG 3.0 export inputs/outputs");
+        const auto &src = inputs.at("src");
+        for (const auto &entry : inputs) {
+            require_image(entry.second, 3, entry.first.c_str());
+            if (entry.second.shape != std::vector<int64_t>{1, 3, 1024, 1024} || entry.second.type != src.type)
+                throw std::runtime_error("V-RMBG 3.0 inputs must have matching precision and shape [1,3,1024,1024]");
+        }
+        for (const auto &entry : outputs) {
+            const int64_t channels = entry.first == "pha" ? 1 : 3;
+            require_image(entry.second, channels, entry.first.c_str());
+            if (entry.second.shape != std::vector<int64_t>{1, channels, 1024, 1024} || entry.second.type != src.type)
+                throw std::runtime_error("V-RMBG 3.0 outputs must have matching precision and fixed 1024 spatial dimensions");
+        }
+        kind_ = ModelKind::VRMBG3;
+        input_name_ = "src"; output_name_ = "pha";
+        width_ = height_ = 1024;
+        label_ = "V-RMBG 3.0 (experimental)";
+    } else if (family) {
+        throw std::runtime_error("Unsupported obs_bg_removal.model metadata");
+    } else if (inputs.size() == 6 && inputs.count("src") && inputs.count("downsample_ratio") && outputs.count("pha")) {
         kind_ = ModelKind::RVM;
         input_name_ = "src"; output_name_ = "pha";
         const auto &src = inputs.at("src");
@@ -202,9 +232,9 @@ Model::Model(const ModelConfig &config) : config_(config)
             throw std::runtime_error("RMBG-1.4 input must be compatible with [1,3,1024,1024]");
         width_ = height_ = 1024;
         label_ = "RMBG-1.4";
-    } else throw std::runtime_error("Unsupported model signature; select RMBG-1.4 or RVM ONNX");
+    } else throw std::runtime_error("Unsupported model signature; select RMBG-1.4, RVM, or exported V-RMBG 3.0 ONNX");
     input_type_ = inputs.at(input_name_).type;
-    if (kind_ == ModelKind::RVM)
+    if (kind_ != ModelKind::RMBG)
         label_ += input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? " FP16" : " FP32";
 }
 
@@ -222,6 +252,20 @@ Ort::Value Model::input_tensor(const Frame &frame)
 
 void Model::reset_recurrence()
 {
+    if (kind_ == ModelKind::VRMBG3) {
+        const std::array<int64_t, 4> shape{1, 3, 1024, 1024};
+        const size_t count = 3 * 1024 * 1024;
+        previous_foreground_ = Ort::Value{nullptr};
+        if (input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            initial_foreground_half_.assign(count, Ort::Float16_t(0.0f));
+            previous_foreground_ = Ort::Value::CreateTensor<Ort::Float16_t>(memory_, initial_foreground_half_.data(), count, shape.data(), shape.size());
+        } else {
+            initial_foreground_.assign(count, 0.0f);
+            previous_foreground_ = Ort::Value::CreateTensor<float>(memory_, initial_foreground_.data(), count, shape.data(), shape.size());
+        }
+        recurrent_frames_ = 0;
+        return;
+    }
     const std::array<int64_t, 4> shape{1, 1, 1, 1};
     for (size_t i = 0; i < recurrent_.size(); ++i) {
         if (input_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)
@@ -258,10 +302,37 @@ Ort::Value Model::run_rvm(const Frame &frame, const Ort::Value &input, Ort::Valu
         throw std::runtime_error("RVM did not return the requested outputs");
     for (size_t i = 0; i < recurrent_.size(); ++i) recurrent_[i] = std::move(outputs[i + 1]);
     if (config_.rvm_foreground) foreground = std::move(outputs[5]);
+    remember_frame(frame);
+    return std::move(outputs[0]);
+}
+
+void Model::remember_frame(const Frame &frame)
+{
     ++recurrent_frames_;
     previous_frame_.width = frame.width; previous_frame_.height = frame.height;
     previous_frame_.source_width = frame.source_width; previous_frame_.source_height = frame.source_height;
     previous_frame_.timestamp_ns = frame.timestamp_ns; previous_frame_.generation = frame.generation;
+}
+
+Ort::Value Model::run_vrmbg3(const Frame &frame, const Ort::Value &input)
+{
+    if (!recurrent_frames_ || !continues_sequence(previous_frame_, frame)) reset_recurrence();
+    Ort::IoBinding binding(session_);
+    binding.BindInput("src", input);
+    binding.BindInput("prev_foreground", previous_foreground_);
+    binding.BindOutput("pha", memory_);
+    auto state_memory = backend_ == "CUDA" ? Ort::MemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault)
+                                            : Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    binding.BindOutput("next_foreground", state_memory);
+    binding.SynchronizeInputs();
+    session_.Run(Ort::RunOptions{nullptr}, binding);
+    binding.SynchronizeOutputs();
+    auto outputs = binding.GetOutputValues();
+    if (outputs.size() != 2 || outputs[1].GetTensorTypeAndShapeInfo().GetShape() != std::vector<int64_t>{1, 3, 1024, 1024} ||
+        outputs[1].GetTensorTypeAndShapeInfo().GetElementType() != input_type_)
+        throw std::runtime_error("Unexpected V-RMBG 3.0 temporal output");
+    previous_foreground_ = std::move(outputs[1]);
+    remember_frame(frame);
     return std::move(outputs[0]);
 }
 
@@ -276,6 +347,7 @@ Mask Model::run(const Frame &frame)
     auto tensor = input_tensor(frame);
     Ort::Value result{nullptr}, foreground{nullptr};
     if (kind_ == ModelKind::RVM) result = run_rvm(frame, tensor, foreground);
+    else if (kind_ == ModelKind::VRMBG3) result = run_vrmbg3(frame, tensor);
     else {
         const char *inputs[] = {input_name_.c_str()}, *outputs[] = {output_name_.c_str()};
         auto values = session_.Run(Ort::RunOptions{nullptr}, inputs, &tensor, 1, outputs, 1);
@@ -292,13 +364,13 @@ Mask Model::run(const Frame &frame)
     mask.timestamp_ns = frame.timestamp_ns; mask.generation = frame.generation;
     mask.capture_id = frame.capture_id;
     const size_t count = size_t(frame.width) * frame.height;
-    mask.direct_alpha = kind_ == ModelKind::RVM;
+    mask.direct_alpha = kind_ != ModelKind::RMBG;
     std::vector<float> expanded;
     const float *alpha;
     if (result_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
         const auto *half = result.GetTensorData<Ort::Float16_t>();
         if (mask.direct_alpha) {
-            // RVM alpha needs one conversion pass, not an FP32 expansion followed by quantization.
+            // Direct alpha needs one conversion pass, not an FP32 expansion followed by quantization.
             mask.pixels = alpha_mask(half, count);
             alpha = nullptr;
         } else {
@@ -321,6 +393,8 @@ Mask Model::run(const Frame &frame)
         mask.downsample_ratio = config_.rvm_downsample > 0 ? config_.rvm_downsample : std::min(1.0f, 480.0f / std::max(frame.width, frame.height));
     mask.recurrent_frames = recurrent_frames_;
     mask.recurrent_on_gpu = kind_ == ModelKind::RVM && recurrent_[0].GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU;
+    if (kind_ == ModelKind::VRMBG3)
+        mask.recurrent_on_gpu = previous_foreground_.GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU;
     mask.inference_ms = (monotonic_ns() - started) / 1e6;
     return mask;
 }
