@@ -1,3 +1,4 @@
+#include "gate.hpp"
 #include "model.hpp"
 #include "png-image.hpp"
 #include <filesystem>
@@ -7,11 +8,12 @@
 int main(int argc, char **argv)
 {
     if (argc < 4) {
-        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO] [--rvm-foreground 0|1]\n";
+        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO] [--rvm-foreground 0|1] [--gate RVM.onnx] [--gate-threshold T] [--gate-expand PCT] [--gate-feather PCT]\n";
         return 2;
     }
     try {
         rmbg::ModelConfig config; config.path = argv[1]; int iterations = 3;
+        rmbg::GateShape shape;
         for (int i = 4; i < argc; i += 2) {
             if (i + 1 >= argc) throw std::runtime_error("Missing option value");
             const std::string option = argv[i], value = argv[i + 1];
@@ -23,12 +25,22 @@ int main(int argc, char **argv)
             else if (option == "--rvm-max-size") config.rvm_max_size = std::stoul(value);
             else if (option == "--rvm-downsample") config.rvm_downsample = std::stof(value);
             else if (option == "--rvm-foreground" && (value == "0" || value == "1")) config.rvm_foreground = value == "1";
+            else if (option == "--gate") config.gate_path = value;
+            else if (option == "--gate-threshold") shape.threshold = std::stof(value);
+            else if (option == "--gate-expand") shape.expand = std::stof(value);
+            else if (option == "--gate-feather") shape.feather = std::stof(value);
             else throw std::runtime_error("Unknown option: " + option);
         }
         if (iterations < 1 || iterations > 1000) throw std::runtime_error("Iterations must be 1..1000");
         const auto source = image_io::read(argv[2]);
         rmbg::Model model(config);
         if (config.rvm_foreground && model.kind() != rmbg::ModelKind::RVM) throw std::runtime_error("Foreground colors require RVM");
+        std::unique_ptr<rmbg::Model> gate;
+        if (!config.gate_path.empty()) {
+            if (model.kind() == rmbg::ModelKind::RVM) throw std::runtime_error("The person gate applies to RMBG or V-RMBG main models");
+            gate = std::make_unique<rmbg::Model>(rmbg::gate_model_config(config));
+            if (gate->kind() != rmbg::ModelKind::RVM) throw std::runtime_error("The person gate model must be RVM");
+        }
         const auto size = model.input_size(source.width, source.height);
         auto resized = image_io::resize(source, size.width, size.height);
         rmbg::Frame frame; frame.width = resized.width; frame.height = resized.height;
@@ -39,14 +51,18 @@ int main(int argc, char **argv)
         rmbg::Mask mask;
         std::vector<double> times;
         for (int i = 0; i < iterations; ++i) {
-            frame.timestamp_ns = rmbg::monotonic_ns(); mask = model.run(frame); times.push_back(mask.inference_ms);
+            frame.timestamp_ns = rmbg::monotonic_ns(); mask = model.run(frame);
+            if (gate) apply_person_gate(*gate, frame, mask, shape);
+            times.push_back(mask.inference_ms);
             std::cout << "Iteration " << i + 1 << ": " << mask.inference_ms << " ms\n" << std::flush;
         }
         auto output = source, preview = source;
         for (uint32_t y = 0; y < source.height; ++y) {
             for (uint32_t x = 0; x < source.width; ++x) {
-                const auto alpha = image_io::sample(mask.pixels.data(), mask.width, mask.height, 1, 0,
+                auto alpha = image_io::sample(mask.pixels.data(), mask.width, mask.height, 1, 0,
                     (x + 0.5f) * mask.width / source.width - 0.5f, (y + 0.5f) * mask.height / source.height - 0.5f);
+                if (!mask.gate.empty()) alpha = uint8_t((unsigned(alpha) * image_io::sample(mask.gate.data(), mask.gate_width, mask.gate_height, 1, 0,
+                    (x + 0.5f) * mask.gate_width / source.width - 0.5f, (y + 0.5f) * mask.gate_height / source.height - 0.5f) + 127) / 255);
                 const size_t i = (size_t(y) * source.width + x) * 4;
                 output.rgba[i + 3] = uint8_t((unsigned(alpha) * source.rgba[i + 3] + 127) / 255);
                 if (!mask.foreground_rgba.empty()) for (size_t c = 0; c < 3; ++c)
@@ -64,6 +80,8 @@ int main(int argc, char **argv)
                   << " ms; model pipeline ceiling: " << 1000 / mean << " FPS (not OBS output FPS)\n";
         std::cout << "Model: " << model.label() << "; input: " << size.width << 'x' << size.height
                   << "; recurrent frames: " << mask.recurrent_frames << "; recurrent state on GPU: " << mask.recurrent_on_gpu << '\n';
+        if (gate) std::cout << "Person gate: " << gate->label() << " on " << gate->backend() << "; gate " << mask.gate_width << 'x'
+                            << mask.gate_height << "; last gate time " << mask.gate_ms << " ms (included above)\n";
         if (!model.warning().empty()) std::cerr << "Warning: " << model.warning() << '\n';
     } catch (const std::exception &e) { std::cerr << "Error: " << e.what() << '\n'; return 1; }
 }

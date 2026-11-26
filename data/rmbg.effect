@@ -7,6 +7,8 @@ uniform bool preview_mask;
 uniform bool direct_alpha;
 uniform texture2d foreground_colors;
 uniform bool use_foreground;
+uniform texture2d gate_mask;
+uniform bool use_gate;
 
 sampler_state linear_sampler {
     Filter = Linear;
@@ -32,6 +34,9 @@ float4 PSDefault(Vertex v) : TARGET
     // RVM and V-RMBG predict calibrated alpha. Default controls preserve it exactly.
     if (direct_alpha)
         coverage = saturate((mask - (threshold - softness)) / (2.0 * softness));
+    // Person gate: keep salient-object pixels only near the RVM person region.
+    if (use_gate)
+        coverage *= gate_mask.Sample(linear_sampler, v.uv).r;
     if (preview_mask)
         return float4(coverage, coverage, coverage, 1.0);
     // OBS textures use premultiplied alpha: multiply RGB and alpha together.

@@ -49,6 +49,7 @@ public:
         gs_texrender_destroy(capture_);
         gs_texture_destroy(mask_texture_);
         gs_texture_destroy(foreground_texture_);
+        gs_texture_destroy(gate_texture_);
         for (auto &frame : video_cache_) gs_texrender_destroy(frame.texture);
         gs_effect_destroy(effect_);
         obs_leave_graphics();
@@ -72,8 +73,14 @@ public:
         settings.match_video = obs_data_get_bool(data, "match_video");
         settings.foreground = settings.match_video && obs_data_get_bool(data, "rvm_foreground");
         model.rvm_foreground = settings.foreground;
+        if (obs_data_get_bool(data, "person_gate")) model.gate_path = obs_data_get_string(data, "gate_model_path");
+        rmbg::GateShape gate;
+        gate.threshold = float(std::clamp(obs_data_get_double(data, "gate_threshold"), 0.05, 0.95));
+        gate.expand = float(std::clamp(obs_data_get_double(data, "gate_expand"), 0.0, 10.0));
+        gate.feather = float(std::clamp(obs_data_get_double(data, "gate_feather"), 0.0, 10.0));
         { std::lock_guard<std::mutex> lock(mutex_); settings_ = settings; }
         worker_.set_smoothing(float(obs_data_get_double(data, "smoothing")));
+        worker_.set_gate_shape(gate);
         worker_.configure(std::move(model), retry);
     }
     obs_source_t *source() const { return source_; }
@@ -115,6 +122,10 @@ public:
         if (s.kind == rmbg::ModelKind::RVM) text << "; downsample: " << std::setprecision(3) << s.downsample_ratio;
         if (s.kind == rmbg::ModelKind::VRMBG3) text << "; fixed 1024 input; RVM controls unused";
         text << "; file: " << s.model_file;
+        if (!s.gate_label.empty()) {
+            text << "; person gate: " << s.gate_label;
+            if (s.gate_ms > 0) text << " (" << std::setprecision(1) << s.gate_ms << " ms of processing)";
+        }
         if (settings_.foreground && s.kind == rmbg::ModelKind::RVM) text << "; experimental RVM foreground colors";
         return text.str();
     }
@@ -187,6 +198,7 @@ public:
             obs_source_skip_video_filter(source_); return;
         }
         const bool use_foreground = matching_video && settings.foreground && state.kind == rmbg::ModelKind::RVM;
+        const bool use_gate = mask->gate_width && mask->gate_height && mask->gate.size() == size_t(mask->gate_width) * mask->gate_height;
         if (use_foreground && mask->foreground_rgba.size() != size_t(mask->width) * mask->height * 4) {
             uploaded_mask_.reset();
             error("Missing or invalid RVM foreground colors; original source visible");
@@ -208,6 +220,15 @@ public:
                 if (!foreground_texture_) throw std::runtime_error("Could not allocate foreground color texture");
                 gs_texture_set_image(foreground_texture_, mask->foreground_rgba.data(), mask->width * 4, false);
             }
+            if (gate_texture_ && (!use_gate || gs_texture_get_width(gate_texture_) != mask->gate_width ||
+                                  gs_texture_get_height(gate_texture_) != mask->gate_height)) {
+                gs_texture_destroy(gate_texture_); gate_texture_ = nullptr;
+            }
+            if (use_gate) {
+                if (!gate_texture_) gate_texture_ = gs_texture_create(mask->gate_width, mask->gate_height, GS_R8, 1, nullptr, GS_DYNAMIC);
+                if (!gate_texture_) throw std::runtime_error("Could not allocate person gate texture");
+                gs_texture_set_image(gate_texture_, mask->gate.data(), mask->gate_width, false);
+            }
             uploaded_mask_ = mask;
         }
         if (!matching_video && !obs_source_process_filter_begin(source_, GS_RGBA, OBS_NO_DIRECT_RENDERING)) return;
@@ -218,6 +239,8 @@ public:
         gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "direct_alpha"), mask->direct_alpha);
         gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "use_foreground"), use_foreground);
         gs_effect_set_texture(gs_effect_get_param_by_name(effect_, "foreground_colors"), use_foreground ? foreground_texture_ : mask_texture_);
+        gs_effect_set_bool(gs_effect_get_param_by_name(effect_, "use_gate"), use_gate);
+        gs_effect_set_texture(gs_effect_get_param_by_name(effect_, "gate_mask"), use_gate ? gate_texture_ : mask_texture_);
         if (matching_video) {
             const bool linear = gs_set_linear_srgb(false);
             const bool srgb = gs_framebuffer_srgb_enabled();
@@ -380,6 +403,7 @@ private:
     gs_stagesurf_t *stage_ = nullptr;
     gs_texture_t *mask_texture_ = nullptr;
     gs_texture_t *foreground_texture_ = nullptr;
+    gs_texture_t *gate_texture_ = nullptr;
     std::shared_ptr<const rmbg::Mask> uploaded_mask_;
     rmbg::Frame staged_frame_;
     bool readback_pending_ = false;
@@ -408,6 +432,14 @@ void defaults(obs_data_t *data)
     obs_data_set_default_bool(data, "immediate_readback", true);
     obs_data_set_default_bool(data, "match_video", settings.match_video);
     obs_data_set_default_bool(data, "rvm_foreground", false);
+    char *gate = obs_module_file("models/rvm_mobilenetv3_fp16.onnx");
+    if (!gate) gate = obs_module_file("models/rvm_mobilenetv3_fp32.onnx");
+    obs_data_set_default_bool(data, "person_gate", false);
+    obs_data_set_default_string(data, "gate_model_path", gate ? gate : ""); bfree(gate);
+    const rmbg::GateShape shape;
+    obs_data_set_default_double(data, "gate_threshold", shape.threshold);
+    obs_data_set_default_double(data, "gate_expand", shape.expand);
+    obs_data_set_default_double(data, "gate_feather", shape.feather);
 }
 void status_proc(void *data, calldata_t *params)
 {
@@ -556,6 +588,12 @@ obs_properties_t *properties(void *data)
     const auto current_state = current_filter ? current_filter->worker_status() : rmbg::WorkerStatus{};
     obs_property_set_enabled(quality, current_state.ready && current_state.kind == rmbg::ModelKind::RVM);
     obs_property_set_enabled(obs_properties_get(rvm, "rvm_foreground"), false);
+    auto *gate = obs_properties_create();
+    obs_properties_add_path(gate, "gate_model_path", obs_module_text("GateModelPath"), OBS_PATH_FILE, "ONNX model (*.onnx)", nullptr);
+    obs_properties_add_float_slider(gate, "gate_threshold", obs_module_text("GateThreshold"), 0.05, 0.95, 0.05);
+    obs_properties_add_float_slider(gate, "gate_expand", obs_module_text("GateExpand"), 0, 10, 0.5);
+    obs_properties_add_float_slider(gate, "gate_feather", obs_module_text("GateFeather"), 0, 10, 0.5);
+    obs_properties_add_group(props, "person_gate", obs_module_text("PersonGate"), OBS_GROUP_CHECKABLE, gate);
     obs_properties_add_int_slider(props, "stale_ms", obs_module_text("StaleTimeout"), 250, 10000, 250);
     obs_properties_add_bool(props, "preview", obs_module_text("Preview"));
     auto *filter = static_cast<Filter *>(data);

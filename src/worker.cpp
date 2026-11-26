@@ -26,6 +26,7 @@ void Worker::configure(ModelConfig config, bool force)
         const auto now = monotonic_ns();
         processing_.reset(now); queue_wait_.reset(now); replacements_.reset(now);
         status_.recurrent_frames = 0; status_.recurrent_on_gpu = false;
+        status_.gate_label.clear(); status_.gate_ms = 0;
         mask_.reset(); pending_.reset(); reload_ = true;
     }
     cv_.notify_one();
@@ -34,6 +35,11 @@ void Worker::set_smoothing(float value)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     smoothing_ = std::clamp(value, 0.0f, 0.95f);
+}
+void Worker::set_gate_shape(GateShape shape)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    gate_shape_ = shape;
 }
 std::vector<uint8_t> Worker::acquire_rgba(size_t bytes)
 {
@@ -90,12 +96,13 @@ std::shared_ptr<const Mask> Worker::latest() const
 }
 void Worker::run()
 {
-    std::unique_ptr<Model> model;
+    std::unique_ptr<Model> model, gate;
     while (true) {
         ModelConfig config;
         uint64_t generation;
         bool load_model;
         float smoothing;
+        GateShape gate_shape;
         std::optional<Frame> frame;
         std::shared_ptr<const Mask> previous;
         {
@@ -104,15 +111,28 @@ void Worker::run()
             if (stopping_) return;
             load_model = reload_; reload_ = false;
             config = requested_; generation = status_.generation;
-            smoothing = smoothing_;
+            smoothing = smoothing_; gate_shape = gate_shape_;
             if (!load_model) { frame = std::move(pending_); pending_.reset(); }
             previous = mask_;
         }
         try {
             if (load_model) {
                 // Release old GPU allocations before opening the replacement session.
-                model.reset();
+                model.reset(); gate.reset();
                 model = std::make_unique<Model>(config);
+                std::string gate_label;
+                if (!config.gate_path.empty() && model->kind() == ModelKind::RVM) {
+                    gate_label = "unused (main model is already RVM)";
+                } else if (!config.gate_path.empty()) {
+                    try {
+                        gate = std::make_unique<Model>(gate_model_config(config));
+                    } catch (const std::exception &e) {
+                        throw std::runtime_error(std::string("Person gate: ") + e.what());
+                    }
+                    if (gate->kind() != ModelKind::RVM)
+                        throw std::runtime_error("Person gate needs an RVM model file (for example rvm_mobilenetv3_fp16.onnx)");
+                    gate_label = gate->label() + " on " + gate->backend();
+                }
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (generation != status_.generation) continue;
                 status_.ready = true; status_.busy = false;
@@ -125,11 +145,14 @@ void Worker::run()
                 const auto now = monotonic_ns();
                 processing_.reset(now); queue_wait_.reset(now); replacements_.reset(now);
                 if (!model->warning().empty()) status_.message += ". " + model->warning();
+                status_.gate_label = gate_label;
+                if (gate && !gate->warning().empty()) status_.message += ". Person gate: " + gate->warning();
                 continue;
             }
             if (!frame || !model) continue;
             const double queue_ms = double(monotonic_ns() - frame->submitted_ns) / 1e6;
             auto mask = std::make_shared<Mask>(model->run(*frame));
+            if (gate) apply_person_gate(*gate, *frame, *mask, gate_shape);
             mask->capture_id = frame->capture_id;
             mask->capture_token = frame->capture_token;
             // Smoothing is expressed at 30 Hz so slow inference doesn't add seconds of lag.
@@ -152,6 +175,7 @@ void Worker::run()
             processing_.add(completed_at, mask->inference_ms); queue_wait_.add(completed_at, queue_ms);
             status_.width = mask->width; status_.height = mask->height;
             status_.recurrent_frames = mask->recurrent_frames; status_.recurrent_on_gpu = mask->recurrent_on_gpu;
+            status_.gate_ms = mask->gate_ms;
             ++status_.completed;
             mask_ = std::move(mask);
         } catch (const std::exception &e) {

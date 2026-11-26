@@ -49,6 +49,7 @@ uint64_t monotonic_ns()
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+ImageSize capture_size(ModelKind, uint32_t width, uint32_t height, uint32_t) { return {width, height}; }
 Model::Model(const ModelConfig &) { width_ = height_ = 1; backend_ = "test"; }
 Mask Model::run(const Frame &frame)
 {

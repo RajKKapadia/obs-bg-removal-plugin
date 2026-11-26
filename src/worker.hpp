@@ -1,4 +1,5 @@
 #pragma once
+#include "gate.hpp"
 #include "model.hpp"
 #include "rolling-stats.hpp"
 #include <condition_variable>
@@ -21,6 +22,8 @@ struct WorkerStatus {
     std::string backend, precision, model_file;
     uint64_t recurrent_frames = 0;
     bool recurrent_on_gpu = false;
+    std::string gate_label; // Empty when no person gate is configured.
+    double gate_ms = 0;
     std::string message = "Waiting for model";
 };
 class Worker {
@@ -31,6 +34,7 @@ public:
     Worker &operator=(const Worker &) = delete;
     void configure(ModelConfig config, bool force = false);
     void set_smoothing(float value);
+    void set_gate_shape(GateShape shape);
     std::vector<uint8_t> acquire_rgba(size_t bytes);
     bool submit(Frame frame);
     WorkerStatus status(bool diagnostics = false) const;
@@ -42,6 +46,7 @@ private:
     std::condition_variable cv_;
     bool stopping_ = false, reload_ = false, configured_ = false;
     float smoothing_ = 0.0f;
+    GateShape gate_shape_;
     ModelConfig requested_;
     WorkerStatus status_;
     RollingMetric processing_, queue_wait_, replacements_;

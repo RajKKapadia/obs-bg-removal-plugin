@@ -18,10 +18,11 @@ struct ModelConfig {
     uint32_t rvm_max_size = 1280;
     float rvm_downsample = 0; // 0 chooses an internal long edge of approximately 480 pixels.
     bool rvm_foreground = false;
+    std::string gate_path = {}; // Optional RVM person gate for RMBG/V-RMBG; empty disables it.
     bool operator==(const ModelConfig &other) const {
         return path == other.path && device == other.device && threads == other.threads &&
                rvm_max_size == other.rvm_max_size && rvm_downsample == other.rvm_downsample &&
-               rvm_foreground == other.rvm_foreground;
+               rvm_foreground == other.rvm_foreground && gate_path == other.gate_path;
     }
 };
 // Identity only: graphics resources always remain owned by the OBS render thread.
@@ -46,6 +47,9 @@ struct Mask {
     bool direct_alpha = false;
     uint64_t recurrent_frames = 0;
     bool recurrent_on_gpu = false;
+    std::vector<uint8_t> gate; // Optional person gate, same capture, multiplied into coverage.
+    uint32_t gate_width = 0, gate_height = 0;
+    double gate_ms = 0;
 };
 bool continues_sequence(const Frame &previous, const Frame &current);
 void prepare_rgb(const Frame &frame, std::vector<float> &tensor, ModelKind kind = ModelKind::RMBG);

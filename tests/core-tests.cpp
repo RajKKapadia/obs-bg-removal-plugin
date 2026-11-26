@@ -1,3 +1,4 @@
+#include "gate.hpp"
 #include "worker.hpp"
 #include "capture-schedule.hpp"
 #include <cmath>
@@ -129,6 +130,47 @@ int main()
         const auto generation = worker.status().generation;
         worker.configure({"/nonexistent/other.onnx", rmbg::Device::CPU, 2});
         require(worker.status().generation == generation + 1 && !worker.latest(), "Changing models invalidates old results");
+        {
+            // Person gate: a lone person pixel grows by the expansion radius and stays binary without feathering.
+            std::vector<uint8_t> person(20 * 10, 0);
+            person[5 * 20 + 10] = 200;
+            rmbg::GateShape shape; shape.threshold = 0.5f; shape.expand = 20; shape.feather = 0; // 20% of 10 rows = 2 px
+            auto grown = rmbg::person_gate(person, 20, 10, shape);
+            require(grown[5 * 20 + 12] == 255 && grown[3 * 20 + 8] == 255 && grown[5 * 20 + 13] == 0 && grown[2 * 20 + 10] == 0,
+                    "Gate expansion dilates the person region by a square radius");
+            shape.threshold = 0.9f;
+            require(rmbg::person_gate(person, 20, 10, shape) == std::vector<uint8_t>(200, 0), "Alpha below the gate threshold is excluded");
+            shape.threshold = 0.5f; shape.expand = 0; shape.feather = 10; // 1 px box blur
+            auto soft = rmbg::person_gate(person, 20, 10, shape);
+            require(soft[5 * 20 + 10] > 0 && soft[5 * 20 + 10] < 255 && soft[5 * 20 + 11] > 0 && soft[5 * 20 + 12] == 0,
+                    "Gate feathering softens edges locally");
+            std::vector<uint8_t> full(20 * 10, 255);
+            require(rmbg::person_gate(full, 20, 10, shape) == full, "Feathering keeps a solid gate solid at the image edges");
+            bool bad_gate = false;
+            try { rmbg::person_gate(full, 20, 9, shape); } catch (const std::invalid_argument &) { bad_gate = true; }
+            require(bad_gate, "Gate rejects mismatched dimensions");
+            // Resampling keeps metadata, drops the capture token, and averages areas.
+            rmbg::Frame square; square.width = square.height = 4; square.source_width = 16; square.source_height = 9;
+            square.timestamp_ns = 42; square.generation = 7; square.capture_token = std::make_shared<rmbg::CaptureToken>();
+            square.rgba.assign(4 * 4 * 4, 0);
+            for (uint32_t y = 0; y < 4; ++y) for (uint32_t x = 2; x < 4; ++x) for (int c = 0; c < 4; ++c) square.rgba[(y * 4 + x) * 4 + c] = 255;
+            const auto half = rmbg::resize_frame(square, {2, 2});
+            require(half.width == 2 && half.height == 2 && half.source_width == 16 && half.timestamp_ns == 42 && half.generation == 7 && !half.capture_token,
+                    "Resampled gate frames keep timing and source metadata without pinning video");
+            require(half.rgba[0] == 0 && half.rgba[4] == 255 && half.rgba[8] == 0 && half.rgba[12] == 255, "Area resampling preserves hard columns");
+            const auto wide = rmbg::resize_frame(square, {3, 1});
+            require(wide.rgba[0] == 0 && wide.rgba[4 * 1] == 128 && wide.rgba[4 * 2] == 255, "Fractional area weights blend straddling pixels");
+            const auto up = rmbg::resize_frame(square, {8, 8});
+            require(up.width == 8 && up.rgba[0] == 0 && up.rgba[7 * 4] == 255, "Upsampling interpolates between source centers");
+            rmbg::ModelConfig main; main.path = "rmbg.onnx"; main.gate_path = "rvm.onnx"; main.device = rmbg::Device::CUDA; main.threads = 6;
+            main.rvm_max_size = 1920; main.rvm_downsample = 0.5f; main.rvm_foreground = true;
+            const auto gate_config = rmbg::gate_model_config(main);
+            require(gate_config.path == "rvm.onnx" && gate_config.device == rmbg::Device::CUDA && gate_config.threads == 6 &&
+                    gate_config.rvm_max_size == rmbg::kGateLongEdge && gate_config.rvm_downsample == 0 && !gate_config.rvm_foreground &&
+                    gate_config.gate_path.empty(), "Gate session inherits device and threads only");
+            rmbg::ModelConfig other = main; other.gate_path.clear();
+            require(!(other == main), "Changing the person gate model reloads the worker");
+        }
         std::cout << "All core checks passed\n";
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

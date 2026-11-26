@@ -165,6 +165,10 @@ int main(int argc, char **argv)
         obs_data_set_bool(data, "match_video", match_video);
     obs_data_set_bool(data, "rvm_foreground", std::getenv("RMBG_TEST_FOREGROUND") != nullptr);
     obs_data_set_int(data, "rvm_max_size", env_number("RMBG_TEST_RVM_SIZE", 1280, 320, 1920));
+    if (const auto *gate = std::getenv("RMBG_TEST_GATE")) {
+        obs_data_set_bool(data, "person_gate", true);
+        obs_data_set_string(data, "gate_model_path", gate);
+    }
     if (argc >= 10) {
         obs_data_set_int(data, "max_fps", std::stoi(argv[7]));
         obs_data_set_double(data, "smoothing", std::stod(argv[8]));
