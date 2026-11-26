@@ -76,7 +76,7 @@ public:
         if (obs_data_get_bool(data, "person_gate")) model.gate_path = obs_data_get_string(data, "gate_model_path");
         rmbg::GateShape gate;
         gate.threshold = float(std::clamp(obs_data_get_double(data, "gate_threshold"), 0.05, 0.95));
-        gate.expand = float(std::clamp(obs_data_get_double(data, "gate_expand"), 0.0, 10.0));
+        gate.close = float(std::clamp(obs_data_get_double(data, "gate_expand"), 0.0, 10.0));
         gate.feather = float(std::clamp(obs_data_get_double(data, "gate_feather"), 0.0, 10.0));
         { std::lock_guard<std::mutex> lock(mutex_); settings_ = settings; }
         worker_.set_smoothing(float(obs_data_get_double(data, "smoothing")));
@@ -438,7 +438,7 @@ void defaults(obs_data_t *data)
     obs_data_set_default_string(data, "gate_model_path", gate ? gate : ""); bfree(gate);
     const rmbg::GateShape shape;
     obs_data_set_default_double(data, "gate_threshold", shape.threshold);
-    obs_data_set_default_double(data, "gate_expand", shape.expand);
+    obs_data_set_default_double(data, "gate_expand", shape.close);
     obs_data_set_default_double(data, "gate_feather", shape.feather);
 }
 void status_proc(void *data, calldata_t *params)

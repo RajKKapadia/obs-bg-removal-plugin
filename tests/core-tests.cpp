@@ -131,19 +131,28 @@ int main()
         worker.configure({"/nonexistent/other.onnx", rmbg::Device::CPU, 2});
         require(worker.status().generation == generation + 1 && !worker.latest(), "Changing models invalidates old results");
         {
-            // Person gate: a lone person pixel grows by the expansion radius and stays binary without feathering.
+            // A narrow hole can be filled without growing the outside edge.
             std::vector<uint8_t> person(20 * 10, 0);
-            person[5 * 20 + 10] = 200;
-            rmbg::GateShape shape; shape.threshold = 0.5f; shape.expand = 20; shape.feather = 0; // 20% of 10 rows = 2 px
-            auto grown = rmbg::person_gate(person, 20, 10, shape);
-            require(grown[5 * 20 + 12] == 255 && grown[3 * 20 + 8] == 255 && grown[5 * 20 + 13] == 0 && grown[2 * 20 + 10] == 0,
-                    "Gate expansion dilates the person region by a square radius");
+            for (int y = 3; y <= 7; ++y)
+                for (int x = 5; x <= 15; ++x) person[y * 20 + x] = 255;
+            person[5 * 20 + 10] = 0;
+            rmbg::GateShape shape{0.5f, 10, 0}; // 10% of 10 rows = 1 px
+            auto closed = rmbg::person_gate(person, 20, 10, shape);
+            require(closed[5 * 20 + 10] == 255 && closed[5 * 20 + 4] == 0 && closed[2 * 20 + 10] == 0,
+                    "Gate closes small gaps without adding an outer band");
+            shape.close = 0;
+            person[5 * 20 + 5] = 128;
+            const auto soft_edge = rmbg::person_gate(person, 20, 10, shape);
+            require(soft_edge[5 * 20 + 5] == 128 && soft_edge[5 * 20 + 10] == 0,
+                    "Default midpoint preserves fractional alpha and zero radius leaves holes alone");
             shape.threshold = 0.9f;
-            require(rmbg::person_gate(person, 20, 10, shape) == std::vector<uint8_t>(200, 0), "Alpha below the gate threshold is excluded");
-            shape.threshold = 0.5f; shape.expand = 0; shape.feather = 10; // 1 px box blur
+            const auto tighter = rmbg::person_gate(person, 20, 10, shape);
+            require(tighter[5 * 20 + 5] < soft_edge[5 * 20 + 5] && tighter[5 * 20 + 6] == 255,
+                    "Higher midpoint tightens fractional coverage and keeps opaque pixels opaque");
+            shape.threshold = 0.5f; shape.feather = 10;
             auto soft = rmbg::person_gate(person, 20, 10, shape);
-            require(soft[5 * 20 + 10] > 0 && soft[5 * 20 + 10] < 255 && soft[5 * 20 + 11] > 0 && soft[5 * 20 + 12] == 0,
-                    "Gate feathering softens edges locally");
+            require(soft[3 * 20 + 7] > 0 && soft[3 * 20 + 7] < 255 && soft[2 * 20 + 7] == 0 && soft[5 * 20 + 7] == 255,
+                    "Gate feathering softens inward without adding background coverage");
             std::vector<uint8_t> full(20 * 10, 255);
             require(rmbg::person_gate(full, 20, 10, shape) == full, "Feathering keeps a solid gate solid at the image edges");
             bool bad_gate = false;

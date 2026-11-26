@@ -8,7 +8,7 @@
 int main(int argc, char **argv)
 {
     if (argc < 4) {
-        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO] [--rvm-foreground 0|1] [--gate RVM.onnx] [--gate-threshold T] [--gate-expand PCT] [--gate-feather PCT]\n";
+        std::cerr << "Usage: rmbg-image MODEL.onnx INPUT.png OUTPUT.png [--device cpu|cuda|auto] [--iterations N] [--threads N] [--rvm-max-size N] [--rvm-downsample RATIO] [--rvm-foreground 0|1] [--gate RVM.onnx] [--gate-threshold T] [--gate-close PCT] [--gate-feather PCT]\n";
         return 2;
     }
     try {
@@ -27,7 +27,7 @@ int main(int argc, char **argv)
             else if (option == "--rvm-foreground" && (value == "0" || value == "1")) config.rvm_foreground = value == "1";
             else if (option == "--gate") config.gate_path = value;
             else if (option == "--gate-threshold") shape.threshold = std::stof(value);
-            else if (option == "--gate-expand") shape.expand = std::stof(value);
+            else if (option == "--gate-close" || option == "--gate-expand") shape.close = std::stof(value);
             else if (option == "--gate-feather") shape.feather = std::stof(value);
             else throw std::runtime_error("Unknown option: " + option);
         }

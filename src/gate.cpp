@@ -1,6 +1,8 @@
 #include "gate.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace rmbg {
@@ -29,18 +31,25 @@ std::vector<std::vector<Tap>> area_taps(uint32_t source, uint32_t target)
     }
     return taps;
 }
-// Sliding-window maximum of a binary line (dilation) with clamped edges.
-void dilate_line(const uint8_t *in, uint8_t *out, size_t count, size_t stride, int radius)
+// Sliding extrema on a grayscale matte. Truncate the window at the frame edges.
+template<class Compare>
+void extrema(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, int radius, Compare compare)
 {
-    int ones = 0;
-    const int n = int(count);
-    for (int i = 0; i <= std::min(radius, n - 1); ++i) ones += in[i * stride] != 0;
-    for (int i = 0; i < n; ++i) {
-        out[i * stride] = ones ? 255 : 0;
-        const int leaving = i - radius, entering = i + radius + 1;
-        if (leaving >= 0) ones -= in[leaving * stride] != 0;
-        if (entering < n) ones += in[entering * stride] != 0;
-    }
+    std::vector<uint8_t> scratch(pixels.size());
+    std::vector<int> candidates(std::max(width, height));
+    auto line = [&](const uint8_t *in, uint8_t *out, int count, size_t stride) {
+        int head = 0, tail = 0, next = 0;
+        for (int i = 0; i < count; ++i) {
+            while (head < tail && candidates[head] < i - radius) ++head;
+            for (; next < count && next <= i + radius; ++next) {
+                while (head < tail && compare(in[next * stride], in[candidates[tail - 1] * stride])) --tail;
+                candidates[tail++] = next;
+            }
+            out[i * stride] = in[candidates[head] * stride];
+        }
+    };
+    for (uint32_t y = 0; y < height; ++y) line(&pixels[size_t(y) * width], &scratch[size_t(y) * width], width, 1);
+    for (uint32_t x = 0; x < width; ++x) line(&scratch[x], &pixels[x], height, width);
 }
 // Box blur of one line; edge samples average only the pixels inside the image.
 void blur_line(const uint8_t *in, uint8_t *out, size_t count, size_t stride, int radius)
@@ -105,12 +114,33 @@ std::vector<uint8_t> person_gate(const std::vector<uint8_t> &alpha, uint32_t wid
 {
     if (!width || !height || alpha.size() != size_t(width) * height)
         throw std::invalid_argument("Invalid person gate dimensions");
-    const float cut = std::clamp(shape.threshold, 0.0f, 1.0f) * 255;
+    const float cut = std::clamp(shape.threshold, 0.05f, 0.95f);
+    // Keep a soft transition around the selected threshold, with guaranteed
+    // transparent and opaque endpoints even at the extremes of the slider.
+    const float low = std::max(0.0f, cut - 0.35f), high = std::min(1.0f, cut + 0.35f);
     std::vector<uint8_t> gate(alpha.size());
-    for (size_t i = 0; i < alpha.size(); ++i) gate[i] = alpha[i] >= cut ? 255 : 0;
+    std::array<uint8_t, 256> coverage{};
+    for (size_t i = 0; i < coverage.size(); ++i) {
+        const float value = float(i) / 255;
+        const float t = value < cut ? 0.5f * (value - low) / (cut - low) : 0.5f + 0.5f * (value - cut) / (high - cut);
+        coverage[i] = uint8_t(std::lround(std::clamp(t, 0.0f, 1.0f) * 255));
+    }
+    std::transform(alpha.begin(), alpha.end(), gate.begin(), [&](uint8_t value) { return coverage[value]; });
     const auto pixels = [&](float percent) { return int(std::lround(std::clamp(percent, 0.0f, 25.0f) / 100 * height)); };
-    separable(gate, width, height, pixels(shape.expand), dilate_line);
-    separable(gate, width, height, pixels(shape.feather), blur_line);
+    const int close = pixels(shape.close);
+    if (close > 0) {
+        // Close gaps between nearby foreground areas without leaving a dilated
+        // band around the silhouette where the main model can keep the room.
+        extrema(gate, width, height, close, std::greater_equal<uint8_t>{});
+        extrema(gate, width, height, close, std::less_equal<uint8_t>{});
+    }
+    const int feather = pixels(shape.feather);
+    if (feather > 0) {
+        auto softened = gate;
+        separable(softened, width, height, feather, blur_line);
+        std::transform(gate.begin(), gate.end(), softened.begin(), gate.begin(),
+                       [](uint8_t original, uint8_t blurred) { return std::min(original, blurred); });
+    }
     return gate;
 }
 
